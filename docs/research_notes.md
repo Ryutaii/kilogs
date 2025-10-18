@@ -695,3 +695,8 @@ grep -n "camera_json" configs/lego_feature_teacher_full_rehab_masked_white.yaml
 - Sanity OK: teacher=teacher → PSNR=∞ / SSIM=1.0 / LPIPS=0
 - Student vs Teacher (PNG直比較、55枚): PSNR=8.967 / SSIM=0.733 / LPIPS=0.285
 - 次アクション: RGBA→白合成で再評価、学習ステップ 10k、MSE 重み↑、SH整合
+
+### 2025-10-18 — 200f white composite eval
+- Student→white(200f) vs Teacher white: PSNR=9.6066 / SSIM=0.7611 / LPIPS=0.2643
+- 背景整合の効果あり（55f直比較 8.97→ 9.61）
+- 次: 学習継続(≥10k steps), 色空間/SH整合の点検, 損失バランス見直し
