@@ -700,3 +700,7 @@ grep -n "camera_json" configs/lego_feature_teacher_full_rehab_masked_white.yaml
 - Student→white(200f) vs Teacher white: PSNR=9.6066 / SSIM=0.7611 / LPIPS=0.2643
 - 背景整合の効果あり（55f直比較 8.97→ 9.61）
 - 次: 学習継続(≥10k steps), 色空間/SH整合の点検, 損失バランス見直し
+
+### 2025-10-18 — worst-N 可視化
+- triptych 生成＆ギャラリー: 16枚（worst-PSNR）
+- パス: results/.../rgba_white/debug_diffs/ （index.html, contact_sheet.png）
