@@ -1,0 +1,7 @@
+{
+  "num_frames": 200,
+  "total_render_time_s": 10.301061087055132,
+  "avg_fps": 19.415475581571958,
+  "gpu_mem_peak_mib": 3243.92333984375,
+  "gpu_mem_reserved_peak_mib": 3504.0
+}

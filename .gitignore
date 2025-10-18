@@ -1,0 +1,31 @@
+# --- heavy artifacts (do not track) ---
+results/**/renders/
+results/**/rgba_npz/
+results/**/opacity/
+results/**/depth/
+teacher/outputs/**/renders/
+logs/
+*.pth
+*.npz
+*.pt
+
+# --- keep metrics under results ---
+!results/**/*.csv
+!results/**/*.json
+!results/**/*.txt
+
+# --- misc ---
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+# heavy artifacts
+results/**/renders/
+results/**/rgba_npz/
+teacher/**/renders/
+*.png
+*.npz
+logs/
+# secrets
+*.key
+*.pem
+.env

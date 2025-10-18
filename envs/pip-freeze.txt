@@ -1,0 +1,45 @@
+absl-py==2.3.1
+brotlicffi @ file:///croot/brotlicffi_1736182461069/work
+certifi @ file:///home/task_175978570070155/conda-bld/certifi_1759786060979/work/certifi
+cffi @ file:///croot/cffi_1736182485317/work
+charset-normalizer @ file:///croot/charset-normalizer_1721748349566/work
+cmake==4.1.0
+easydict==1.13
+filelock @ file:///croot/filelock_1744281381737/work
+gmpy2 @ file:///croot/gmpy2_1738085463648/work
+grpcio==1.75.1
+idna @ file:///croot/idna_1714398848350/work
+imageio==2.37.0
+Jinja2 @ file:///croot/jinja2_1741710844255/work
+lit==15.0.7
+lpips==0.1.4
+Markdown==3.9
+MarkupSafe @ file:///croot/markupsafe_1738584038848/work
+mkl-service==2.4.0
+mpmath @ file:///croot/mpmath_1690848262763/work
+networkx @ file:///croot/networkx_1737039604450/work
+ninja==1.13.0
+numpy @ file:///croot/numpy_and_numpy_base_1755590845055/work/dist/numpy-1.26.4-cp310-cp310-linux_x86_64.whl#sha256=1096d33ad9a9757a1b4b46634d809e894263fc8b78780bff36801684b6e8cc88
+nvidia-ml-py3==7.352.0
+opencv-python-headless==4.12.0.88
+packaging==25.0
+pillow @ file:///croot/pillow_1752524526621/work
+plyfile==1.1.2
+protobuf==6.33.0
+pybind11==3.0.1
+pycparser @ file:///home/task_175749556993857/conda-bld/pycparser_1757496041120/work
+PySocks @ file:///home/builder/ci_310/pysocks_1640793678128/work
+PyYAML==6.0.3
+requests @ file:///croot/requests_1756709366904/work
+scipy==1.15.3
+sympy @ file:///croot/sympy_1756713465822/work
+tensorboard==2.20.0
+tensorboard-data-server==0.7.2
+torch==2.0.1+cu118
+torchaudio==2.0.2+cu118
+torchvision==0.15.2+cu118
+tqdm==4.67.1
+triton==2.0.0
+typing_extensions @ file:///croot/typing_extensions_1756280817316/work
+urllib3 @ file:///croot/urllib3_1750775463400/work
+Werkzeug==3.1.3

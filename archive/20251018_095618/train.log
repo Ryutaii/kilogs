@@ -1,0 +1,2 @@
+[debug] importing lego_response_distill from /mnt/d/imaizumi/kilogs/distill/lego_response_distill.py
+[logging] TensorBoard writer initialised → logs/lego/feat_t_full/runs/teacher_full_rehab_masked_white/tensorboard
