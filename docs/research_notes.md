@@ -690,3 +690,8 @@ grep -n "camera_json" configs/lego_feature_teacher_full_rehab_masked_white.yaml
 - 単枚～8枚評価 OK（白背景, teacher ours_30000）：PSNR ≈ 8.76 / SSIM ≈ 0.748 / LPIPS ≈ 0.271
 - Git: Private リポに push 済み＋タグ `exp-lego-fdistill-001000-8f-seed2025`、bundle も保存
 - 次: 200 frame レンダ完了後に新タグでスナップ（`exp_snap <TAG>` 予定）
+
+### 2025-10-18 — Eval sanity & student v teacher
+- Sanity OK: teacher=teacher → PSNR=∞ / SSIM=1.0 / LPIPS=0
+- Student vs Teacher (PNG直比較、55枚): PSNR=8.967 / SSIM=0.733 / LPIPS=0.285
+- 次アクション: RGBA→白合成で再評価、学習ステップ 10k、MSE 重み↑、SH整合
