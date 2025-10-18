@@ -279,6 +279,8 @@ python tools/run_eval_pipeline.py \
 
 ---
 
+
+
 ## Troubleshooting checklist
 
 * `import kilonerf_cuda` fails → ensure `.pth` file exists **and** `LD_LIBRARY_PATH` includes torch lib dir.
@@ -655,3 +657,36 @@ grep -n "camera_json" configs/lego_feature_teacher_full_rehab_masked_white.yaml
 4) チェックポイント/設定の齟齬確認（hidden_dim, grid_resolution, projector入出力次元）
 
 上記の切り分けで問題点を特定し、必要なら再レンダ/再学習を検討。
+
+## 2025-10-18 — WSL Kilogs bring-up (Raphaelログ)
+- Torch stack: torch 2.0.1+cu118 / torchvision 0.15.2+cu118 / torchaudio 2.0.2+cu118
+- NumPy: 1.26.4（2.x 非互換問題を回避）
+- 修正:
+  - KiloNeRF CUDA 拡張をビルド＆読み込み（`kilonerf_cuda`）
+  - `libc10.so` 対策: `LD_LIBRARY_PATH` に `torch/lib` を追加
+  - `sys.path`/`.pth` で `kilonerf` と `nerf` を解決
+  - 画像評価: `psnr` の `view` → `.flatten(1)` に置換（メモリ配置非連続対策）
+  - `rgba_npz` のファイル名: `file_stub.with_suffix(".npz")` → `Path(file_stub.name).with_suffix(".npz")`
+- レンダリング: step_001000 / 8 frames 完了
+  - metrics（白背景, teacher=ours_30000）: PSNR ≈ 8.76 / SSIM ≈ 0.748 / LPIPS ≈ 0.271
+  - `tools/run_eval_pipeline.py` で PNG 直比較も動作確認
+- Git:
+  - 初期化・.gitignore 整備（renders/ rgba_npz/ など重量物を除外）
+  - ユーザー名/メール設定（ローカル）
+  - SSH 鍵 → GitHub 登録 → Private リポへ push 成功
+  - タグ: `exp-lego-fdistill-001000-8f-seed2025`
+  - オフラインバックアップ: `git bundle` 作成（`~/kilogs-YYYY-MM-DD.bundle`）
+- 次のアクション:
+  - 200 frames レンダを継続、完了時にタグ `exp-lego-fdistill-001000-200f-seed2025` を付与
+  - `exp_snap <タグ名>` で再現スナップ取って push（下のエイリアス参照）
+
+
+## 2025-10-18 — WSL Kilogs bring-up (Raphaelログ)
+- Torch: 2.0.1+cu118 / TV: 0.15.2+cu118 / TA: 2.0.2+cu118 / NumPy: 1.26.4
+- CUDA 拡張: `kilonerf_cuda` をビルド・読込成功（libc10.so は LD_LIBRARY_PATH で解決）
+- import 解決: `.pth` に /mnt/d/imaizumi/kilonerf /mnt/d/imaizumi /mnt/d/imaizumi/nerf を追加
+- PSNR 関数の `.view` → `.flatten(1)` に変更（非連続テンソル対応）
+- `rgba_npz` の保存名: `file_stub.with_suffix('.npz')` → `Path(file_stub.name).with_suffix('.npz')`
+- 単枚～8枚評価 OK（白背景, teacher ours_30000）：PSNR ≈ 8.76 / SSIM ≈ 0.748 / LPIPS ≈ 0.271
+- Git: Private リポに push 済み＋タグ `exp-lego-fdistill-001000-8f-seed2025`、bundle も保存
+- 次: 200 frame レンダ完了後に新タグでスナップ（`exp_snap <TAG>` 予定）
