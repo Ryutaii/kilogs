@@ -29,3 +29,11 @@ logs/
 *.key
 *.pem
 .env
+
+# keys & creds
+*.pem
+*.ppk
+id_ed25519*
+*.pub
+*.key
+.env
