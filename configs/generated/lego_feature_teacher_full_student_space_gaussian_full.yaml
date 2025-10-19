@@ -1,0 +1,123 @@
+experiment:
+  name: lego_feature_teacher_full_student_space_gaussian_full
+  seed: 2025
+  output_dir: results/lego/feat_t_full/runs/student_space_gaussian_full
+  progress_desc: 特徴蒸留_student空間_gaussian_full
+
+data:
+  dataset_root: ../3dgs/data/nerf_synthetic/lego
+  teacher_outputs: teacher/outputs/lego/test_white/ours_30000
+  teacher_depth_dir: teacher/outputs/lego/test_white/ours_30000/depth
+  camera_json: teacher/outputs/lego/test_white/ours_30000/transforms_test_white.json
+  background_color: [1.0, 1.0, 1.0]
+  batch_size: 8192
+  ray_chunk: 1024
+  near: 2.0
+  far: 6.0
+  samples_per_ray: 128
+  bbox_min: [-1.5, -1.5, -1.5]
+  bbox_max: [1.5, 1.5, 1.5]
+  perturb: true
+
+teacher:
+  type: gaussian_splatting
+  checkpoint: teacher/checkpoints/lego/point_cloud/iteration_30000/point_cloud.ply
+  render_stats: teacher/outputs/lego/test_white/ours_30000/render_stats.json
+
+student:
+  type: kilo_uniform_mlp
+  grid_resolution: [2, 18, 10]
+  hidden_dim: 128
+  num_layers: 4
+  activation: relu
+  density_bias: -1.0
+  color_bias: 0.0
+  regularization_weight: 1e-4
+  enable_boundary_blend: true
+  boundary_blend_margin: 0.08
+
+train:
+  max_steps: 50000
+  phases:
+    - name: projector_warmup
+      end_step: 2000
+      optimize: [projector, teacher_adapter]
+      freeze_student: true
+      phase_feature_scale: 0.5
+      force_feature_on: true
+    - name: joint_training
+      end_step: 50000
+      optimize: [student, projector, teacher_adapter]
+      freeze_student: false
+      phase_feature_scale: 1.0
+  eval_interval: 10000
+  checkpoint_interval: 10000
+  lr: 5e-4
+  lr_schedule: cosine
+  lr_schedule_steps: 50000
+  gradient_clip_norm: 1.0
+  ema_decay: 0.999
+
+loss:
+  color:
+    type: l2
+    weight: 1.0
+  opacity:
+    type: l1
+    weight: 0.25
+    target: 0.05
+    target_weight: 0.35
+    warmup_steps: 2000
+    schedule: cosine
+    schedule_duration: 6000
+    background_threshold: 0.05
+  depth:
+    type: smooth_l1
+    weight: 0.3
+    alpha_threshold: 0.6
+  feature_l2:
+    weight: 0.05
+    warmup:
+      steps: 4000
+      type: linear
+      start_weight: 0.0
+  feature_cos:
+    weight: 0.01
+    warmup:
+      steps: 4000
+      type: linear
+      start_weight: 0.0
+
+feature_targets:
+  l2_target: 0.05
+  cos_target: 0.01
+
+feature_pipeline:
+  enabled: true
+  teacher_mode: gaussian_full
+  compare_space: student
+  allow_dim_mismatch: true
+  projector:
+    in_dim: 128
+    hidden_dim: 128
+    out_dim: 128
+    use_layer_norm: true
+    activation: relu
+    dropout: 0.0
+  teacher_adapter:
+    type: linear
+    activation: relu
+    use_layer_norm: true
+    output_dim: 128
+  student_adapter: null
+  boundary_mask_threshold: 0.60
+  boundary_mask_soft_transition: 0.10
+  mask_controller: null
+
+logging:
+  tensorboard: logs/lego/feat_t_full/runs/student_space_gaussian_full/tensorboard
+  csv: logs/lego/feat_t_full/runs/student_space_gaussian_full/training_metrics.csv
+  render_preview_interval: 10000
+
+dataset: {frames: 200, size: 800}
+background: masked_white

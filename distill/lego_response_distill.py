@@ -2824,7 +2824,7 @@ def parse_config(path: Path):
     return experiment, data, teacher, student, train_cfg, loss_cfg, logging_cfg, feature_cfg, feature_aux_cfg
 
 
-def set_seed(seed: int):
+def set_seed(seed: int, *, strict_pythonhash: bool = True) -> None:
     workspace_config = os.environ.get("CUBLAS_WORKSPACE_CONFIG")
     if workspace_config in {":16:8", ":4096:8"}:
         print(f"[seed] CUBLAS_WORKSPACE_CONFIG={workspace_config} (deterministic cuBLAS kernels enabled).")
@@ -2833,13 +2833,20 @@ def set_seed(seed: int):
             "[seed] Warning: CUBLAS_WORKSPACE_CONFIG=%s may be non-deterministic; unset or use ':16:8' / ':4096:8' if reproducibility drifts." % workspace_config
         )
     else:
-        print("[seed] CUBLAS_WORKSPACE_CONFIG unset; using cuBLAS defaults (faster, potentially non-deterministic).")
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+        workspace_config = ":4096:8"
+        print("[seed] CUBLAS_WORKSPACE_CONFIG unset; forcing ':4096:8' for deterministic cuBLAS kernels.")
 
     hash_seed = os.environ.get("PYTHONHASHSEED")
     if hash_seed != str(seed):
-        raise SystemExit(
-            f"[seed] PYTHONHASHSEED is {hash_seed or 'unset'}; export PYTHONHASHSEED={seed} before launching to preserve reproducibility."
+        message = (
+            f"[seed] PYTHONHASHSEED is {hash_seed or 'unset'}; expected {seed} for reproducibility."
         )
+        if strict_pythonhash:
+            raise SystemExit(message + " Export PYTHONHASHSEED before launching.")
+        print(message + " Setting PYTHONHASHSEED in-process for evaluation.")
+        os.environ["PYTHONHASHSEED"] = str(seed)
+        hash_seed = str(seed)
     print(f"[seed] PYTHONHASHSEED aligned to {hash_seed}.")
 
     torch.manual_seed(seed)
@@ -2848,21 +2855,17 @@ def set_seed(seed: int):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-    deterministic_workspace = workspace_config in {":16:8", ":4096:8"}
     try:
-        if deterministic_workspace:
-            torch.use_deterministic_algorithms(True, warn_only=True)
-        else:
-            torch.use_deterministic_algorithms(False)
+        torch.use_deterministic_algorithms(True, warn_only=False)
     except Exception as err:
-        print(f"[seed] Failed to configure deterministic algorithms: {err}")
+        print(f"[seed] Failed to enforce deterministic algorithms: {err}")
 
-    torch.backends.cudnn.deterministic = deterministic_workspace
-    torch.backends.cudnn.benchmark = not deterministic_workspace
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
     if hasattr(torch.backends.cuda.matmul, "allow_tf32"):
-        torch.backends.cuda.matmul.allow_tf32 = deterministic_workspace is False
+        torch.backends.cuda.matmul.allow_tf32 = False
     if hasattr(torch.backends.cudnn, "allow_tf32"):
-        torch.backends.cudnn.allow_tf32 = deterministic_workspace is False
+        torch.backends.cudnn.allow_tf32 = False
 
 
 def compute_losses(

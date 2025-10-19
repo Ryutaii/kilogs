@@ -26,7 +26,7 @@ teacher:
 
 student:
   type: kilo_uniform_mlp
-  grid_resolution: [6, 6, 6]
+  grid_resolution: [2, 18, 10]
   hidden_dim: 128
   num_layers: 4
   activation: relu

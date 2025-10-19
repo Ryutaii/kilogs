@@ -18,12 +18,21 @@ from tqdm import tqdm
 from lego_response_distill import (
     LegoRayDataset,
     StudentModel,
+<<<<<<< ours
     get_camera_rays,
     intersect_rays_aabb,
     parse_config,
     sample_along_rays,
     _exclusive_cumprod_last,
     set_seed,
+=======
+    _exclusive_cumprod_last,
+    get_camera_rays,
+    intersect_rays_aabb,
+    parse_config,
+    set_seed,
+    sample_along_rays,
+>>>>>>> theirs
 )
 
 
@@ -73,8 +82,14 @@ def render_valid_rays(
         deltas = torch.cat([deltas, delta_last], dim=-1)
 
         alpha = 1.0 - torch.exp(-student_sigma_samples * deltas)
+<<<<<<< ours
         transmittance = _exclusive_cumprod_last(1.0 - alpha + 1e-10)
         weights = alpha * transmittance
+=======
+        # Match the deterministic accumulation used during training.
+        transmittance = _exclusive_cumprod_last(1.0 - alpha + 1e-10)
+        weights = alpha * transmittance
+>>>>>>> theirs
 
         rgb_map = torch.sum(weights[..., None] * student_rgb_samples, dim=-2)
         opacity_map = weights.sum(dim=-1, keepdim=True)
@@ -85,6 +100,7 @@ def render_valid_rays(
 
 
 @torch.no_grad()
+<<<<<<< ours
 def evaluate(config_path: Path, checkpoint_path: Path, output_csv: Path | None = None) -> Dict[str, float]:
     (
         experiment_cfg,
@@ -92,11 +108,22 @@ def evaluate(config_path: Path, checkpoint_path: Path, output_csv: Path | None =
         _teacher_cfg,
         student_cfg,
         _train_cfg,
+=======
+def evaluate(config_path: Path, checkpoint_path: Path, output_csv: Path | None = None) -> Dict[str, float]:
+    (
+        experiment_cfg,
+        data_cfg,
+        _teacher_cfg,
+        student_cfg,
+        _train_cfg,
+>>>>>>> theirs
         _loss_cfg,
         logging_cfg,
         _feature_cfg,
         _feature_aux_cfg,
     ) = parse_config(config_path)
+
+    set_seed(experiment_cfg.seed, strict_pythonhash=False)
 
     # Deterministic guard: force cuBLAS workspace and seed
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
