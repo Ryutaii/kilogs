@@ -23,6 +23,8 @@ from distill.lego_response_distill import (
     _build_gaussian_cell_features,
     parse_config,
     sample_along_rays,
+    _exclusive_cumprod_last,
+    set_seed,
 )
 from distill.student_projectors import (
     ProjectorConfig as StudentProjectorConfig,
@@ -62,6 +64,15 @@ def inspect_alignment(
         feature_cfg,
         _feature_aux_cfg,
     ) = parse_config(config_path)
+
+    # Deterministic guard for analysis runs
+    import os
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
+    os.environ.setdefault("PYTHONHASHSEED", str(int(_experiment_cfg.seed)))
+    try:
+        set_seed(int(_experiment_cfg.seed))
+    except Exception:
+        pass
 
     dataset = LegoRayDataset(data_cfg)
     torch_device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -167,10 +178,7 @@ def inspect_alignment(
         deltas = torch.cat([deltas, delta_last], dim=-1)
 
         alpha = 1.0 - torch.exp(-student_sigma_samples * deltas)
-        transmittance = torch.cumprod(
-            torch.cat([torch.ones(alpha.shape[0], 1, device=torch_device), 1.0 - alpha + 1e-10], dim=-1),
-            dim=-1,
-        )[:, :-1]
+        transmittance = _exclusive_cumprod_last(1.0 - alpha + 1e-10)
         weights = alpha * transmittance
 
         feature_stats: Dict[str, Any] = {

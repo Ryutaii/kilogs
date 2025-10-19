@@ -1,4 +1,5 @@
 import argparse
+import os
 import math
 import sys
 from pathlib import Path
@@ -21,6 +22,8 @@ from lego_response_distill import (
     intersect_rays_aabb,
     parse_config,
     sample_along_rays,
+    _exclusive_cumprod_last,
+    set_seed,
 )
 
 
@@ -70,10 +73,7 @@ def render_valid_rays(
         deltas = torch.cat([deltas, delta_last], dim=-1)
 
         alpha = 1.0 - torch.exp(-student_sigma_samples * deltas)
-        transmittance = torch.cumprod(
-            torch.cat([torch.ones(alpha.shape[0], 1, device=device), 1.0 - alpha + 1e-10], dim=-1),
-            dim=-1,
-        )[:, :-1]
+        transmittance = _exclusive_cumprod_last(1.0 - alpha + 1e-10)
         weights = alpha * transmittance
 
         rgb_map = torch.sum(weights[..., None] * student_rgb_samples, dim=-2)
@@ -97,6 +97,14 @@ def evaluate(config_path: Path, checkpoint_path: Path, output_csv: Path | None =
         _feature_cfg,
         _feature_aux_cfg,
     ) = parse_config(config_path)
+
+    # Deterministic guard: force cuBLAS workspace and seed
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
+    os.environ.setdefault("PYTHONHASHSEED", str(int(experiment_cfg.seed)))
+    try:
+        set_seed(int(experiment_cfg.seed))
+    except Exception:
+        pass
 
     dataset = LegoRayDataset(data_cfg)
 

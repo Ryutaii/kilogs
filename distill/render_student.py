@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import sys
 import time
 import types
@@ -185,10 +186,8 @@ def volumetric_render(student: StudentModel,
         deltas = torch.cat([deltas, delta_last], dim=-1)
 
         alpha = 1.0 - torch.exp(-sigma * deltas)
-        transmittance = torch.cumprod(
-            torch.cat([torch.ones(alpha.shape[0], 1, device=device), 1.0 - alpha + 1e-10], dim=-1),
-            dim=-1,
-        )[:, :-1]
+        # Deterministic exclusive cumulative product to avoid non-deterministic CUDA cumprod
+        transmittance = lrd._exclusive_cumprod_last(1.0 - alpha + 1e-10)
         weights = alpha * transmittance
 
         rgb_pre_map = torch.sum(weights[..., None] * rgb, dim=-2)
@@ -284,6 +283,14 @@ def render_student_scene(args):
         _feature_cfg,
         _feature_aux_cfg,
     ) = parse_config(config_path)
+
+    # Enforce deterministic evaluation: set cuBLAS workspace and seed
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
+    os.environ.setdefault("PYTHONHASHSEED", str(int(experiment.seed)))
+    try:
+        lrd.set_seed(int(experiment.seed))
+    except Exception:
+        pass
 
     checkpoint_path = Path(args.checkpoint)
     if not checkpoint_path.exists():
@@ -471,8 +478,8 @@ def render_student_scene(args):
         "total_render_time_s": total_time,
         "avg_fps": num_frames / max(total_time, 1e-6),
         "per_view_time_s": per_view_times,
-    "start_frame": start_index,
-    "chunk_size": args.chunk,
+        "start_frame": start_index,
+        "chunk_size": args.chunk,
         "num_samples": args.num_samples,
         "near": args.near,
         "far": args.far,
