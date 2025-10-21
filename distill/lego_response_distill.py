@@ -1,4 +1,5 @@
 import argparse
+import atexit
 import csv
 import ctypes
 import io
@@ -19,13 +20,12 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, Optional, Tuple, List, Sequence, Set, Deque, Callable
+from typing import Deque, Dict, List, Optional, Sequence, Set, Tuple, Callable
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 import yaml
-from typing import Dict, Optional, Tuple, List, Sequence, Set, Deque, Callable
 from distill.config_schema import validate_config_dict
 from imageio import v2 as imageio
 from torch.utils.data import Dataset
@@ -1002,6 +1002,7 @@ class LoggingConfig:
     render_preview_interval: int
     scalar_interval: int = 100
     tensorboard_flush_secs: Optional[int] = None
+    tensorboard_axis: str = "step"
 
 
 @dataclass
@@ -2814,12 +2815,27 @@ def parse_config(path: Path):
         if flush_secs_candidate is not None and flush_secs_candidate > 0:
             flush_secs = flush_secs_candidate
 
+    axis_raw_value = logging_raw.get("tensorboard_axis")
+    axis_mode = "step"
+    if isinstance(axis_raw_value, str):
+        candidate = axis_raw_value.strip().lower()
+        if candidate in {"step", "time", "elapsed"}:
+            axis_mode = candidate
+    elif axis_raw_value is not None:
+        try:
+            candidate = str(axis_raw_value).strip().lower()
+        except Exception:
+            candidate = ""
+        if candidate in {"step", "time", "elapsed"}:
+            axis_mode = candidate
+
     logging_cfg = LoggingConfig(
         tensorboard=Path(logging_raw["tensorboard"]),
         csv=Path(logging_raw["csv"]),
         render_preview_interval=int(logging_raw["render_preview_interval"]),
         scalar_interval=scalar_interval,
         tensorboard_flush_secs=flush_secs,
+        tensorboard_axis=axis_mode,
     )
     return experiment, data, teacher, student, train_cfg, loss_cfg, logging_cfg, feature_cfg, feature_aux_cfg
 
@@ -3097,7 +3113,38 @@ def train(
         print(f"[logging] Failed to initialise TensorBoard writer: {err}")
         writer = None
 
-    set_seed(experiment.seed)
+    tensorboard_axis_mode = (logging_cfg.tensorboard_axis or "step").strip().lower()
+    if tensorboard_axis_mode not in {"step", "time", "elapsed"}:
+        tensorboard_axis_mode = "step"
+    logging_cfg.tensorboard_axis = tensorboard_axis_mode
+    tensorboard_use_walltime = tensorboard_axis_mode in {"time", "elapsed"}
+    tensorboard_use_elapsed = tensorboard_axis_mode == "elapsed"
+    train_start_wall = time.time()
+
+    if writer is not None:
+        def _close_tensorboard_writer() -> None:
+            try:
+                writer.flush()
+            except Exception as err:
+                debug_log(f"tb_flush_error_teardown err={err}")
+            try:
+                writer.close()
+            except Exception as err:
+                debug_log(f"tb_close_error_teardown err={err}")
+
+        atexit.register(_close_tensorboard_writer)
+
+    strict_pythonhash = _coerce_bool(os.getenv("KILOGS_STRICT_PYHASH"), default=False)
+    if not strict_pythonhash:
+        expected_hash = str(experiment.seed)
+        current_hash = os.environ.get("PYTHONHASHSEED")
+        if current_hash != expected_hash:
+            print(
+                f"[seed] Aligning PYTHONHASHSEED to {expected_hash} (previously {current_hash or 'unset'}).",
+                flush=True,
+            )
+            os.environ["PYTHONHASHSEED"] = expected_hash
+    set_seed(experiment.seed, strict_pythonhash=strict_pythonhash)
 
     dataset = LegoRayDataset(data_cfg)
 
@@ -3820,55 +3867,184 @@ def train(
     promotion_min_mask_fraction = max(0.0, float(train_cfg.promotion_min_mask_fraction))
     promotion_min_feature_scale = max(0.0, float(train_cfg.promotion_min_feature_scale))
 
-    def append_metrics(step: int, total_loss_val: float, loss_values: Dict[str, torch.Tensor]) -> None:
+    known_metric_keys: List[str] = []
+    logged_steps_tb: Set[int] = set()
+
+    def write_metrics_csv(
+        step: int,
+        total_loss_val: float,
+        raw_metrics: Dict[str, torch.Tensor],
+    ) -> Dict[str, float]:
+        nonlocal known_metric_keys
         csv_path = logging_cfg.csv
-        file_exists = csv_path.exists()
-        loss_keys = sorted(loss_values.keys())
-        headers = ["timestamp", "step", "total"] + loss_keys + ["_eor_checksum"]
-        if file_exists:
+        metrics_floats: Dict[str, float] = {}
+        for key, value in raw_metrics.items():
+            if isinstance(value, torch.Tensor):
+                try:
+                    metrics_floats[key] = float(value.detach().cpu().item())
+                except (AttributeError, ValueError):
+                    metrics_floats[key] = float("nan")
+            else:
+                try:
+                    metrics_floats[key] = float(value)
+                except (TypeError, ValueError):
+                    metrics_floats[key] = float("nan")
+
+        metric_keys_sorted = sorted(metrics_floats.keys())
+        prefix = ["timestamp", "step", "total"]
+        suffix = ["_eor_checksum"]
+        existing_header: Optional[List[str]] = None
+        existing_row_maps: List[Dict[str, str]] = []
+
+        if csv_path.exists():
             try:
                 with csv_path.open("r", newline="", encoding="utf-8") as existing_fp:
                     csv_reader = csv.reader(existing_fp)
                     existing_header = next(csv_reader, None)
-            except Exception:
+                    if existing_header is not None:
+                        if existing_header[: len(prefix)] == prefix and existing_header[-1:] == suffix:
+                            if not known_metric_keys:
+                                known_metric_keys = list(existing_header[len(prefix) : -1])
+                            for row in csv_reader:
+                                if not row:
+                                    continue
+                                row_map: Dict[str, str] = {}
+                                for idx, column in enumerate(existing_header):
+                                    if idx < len(row):
+                                        row_map[column] = row[idx]
+                                existing_row_maps.append(row_map)
+                        else:
+                            backup_path = csv_path.with_suffix(csv_path.suffix + ".legacy")
+                            try:
+                                csv_path.rename(backup_path)
+                            except OSError as err:
+                                print(f"[logging] Failed to rotate metrics CSV: {err}")
+                            else:
+                                print(f"[logging] Rotated metrics CSV header mismatch → '{backup_path.name}'")
+                            existing_header = None
+                            existing_row_maps = []
+            except Exception as err:
+                print(f"[logging] Failed to read metrics CSV: {err}")
                 existing_header = None
-            if existing_header is not None and list(existing_header) != headers:
-                backup_path = csv_path.with_suffix(csv_path.suffix + ".legacy")
-                try:
-                    csv_path.rename(backup_path)
-                except OSError as err:
-                    print(f"[logging] Failed to rotate metrics CSV: {err}")
-                else:
-                    print(f"[logging] Rotated metrics CSV header mismatch → '{backup_path.name}'")
-                    file_exists = False
-        row = [
-            datetime.utcnow().isoformat(),
-            step,
-            f"{total_loss_val:.6f}",
-        ] + [f"{loss_values[key].item():.6f}" for key in loss_keys]
-        payload = "|".join(str(value) for value in row)
-        checksum = format(zlib.crc32(payload.encode("utf-8")) & 0xFFFFFFFF, "08x")
-        row.append(checksum)
-        with csv_path.open("a", newline="", encoding="utf-8") as fp:
-            csv_writer = csv.writer(fp)
-            if not file_exists:
-                csv_writer.writerow(headers)
-            csv_writer.writerow(row)
-        if step <= (start_step + 200):
-            debug_log(f"append_metrics step={step}")
-        if writer is not None:
-            def _to_float(value: object) -> float:
-                if isinstance(value, torch.Tensor):
-                    return float(value.item())
-                return float(value)
+                existing_row_maps = []
 
-            writer.add_scalar("loss/total", total_loss_val, step)
-            for key in ("color", "opacity", "depth"):
-                if key in loss_values:
-                    writer.add_scalar(f"loss/{key}", _to_float(loss_values[key]), step)
-            for key in ("feature_recon", "feature_cosine"):
-                if key in loss_values:
-                    writer.add_scalar(f"loss/{key}", _to_float(loss_values[key]), step)
+        if not known_metric_keys:
+            known_metric_keys = list(metric_keys_sorted)
+        else:
+            new_keys = [key for key in metric_keys_sorted if key not in known_metric_keys]
+            if new_keys:
+                known_metric_keys = list(known_metric_keys) + new_keys
+
+        headers = prefix + list(known_metric_keys) + suffix
+
+        def _serialize_row(row_map: Dict[str, str]) -> List[str]:
+            row_values_existing: List[str] = [
+                row_map.get("timestamp", ""),
+                row_map.get("step", ""),
+                row_map.get("total", "nan"),
+            ]
+            for key in known_metric_keys:
+                row_values_existing.append(row_map.get(key, "nan"))
+            payload_existing = "|".join(row_values_existing)
+            checksum_existing = format(zlib.crc32(payload_existing.encode("utf-8")) & 0xFFFFFFFF, "08x")
+            row_values_existing.append(checksum_existing)
+            return row_values_existing
+
+        existing_row_maps = [row for row in existing_row_maps if row.get("step") != str(step)]
+        rows_to_write: List[List[str]] = [_serialize_row(row_map) for row_map in existing_row_maps]
+
+        row_values: List[str] = [
+            datetime.utcnow().isoformat(),
+            str(step),
+            f"{total_loss_val:.6f}" if math.isfinite(total_loss_val) else "nan",
+        ]
+        for key in known_metric_keys:
+            value = metrics_floats.get(key, float("nan"))
+            row_values.append(f"{value:.6f}" if math.isfinite(value) else "nan")
+        payload = "|".join(row_values)
+        checksum = format(zlib.crc32(payload.encode("utf-8")) & 0xFFFFFFFF, "08x")
+        row_values.append(checksum)
+        rows_to_write.append(row_values)
+
+        try:
+            with csv_path.open("w", newline="", encoding="utf-8") as fp:
+                csv_writer = csv.writer(fp)
+                csv_writer.writerow(headers)
+                csv_writer.writerows(rows_to_write)
+        except Exception as err:
+            print(f"[logging] Failed to write metrics CSV: {err}")
+
+        debug_log(
+            "csv_append step=%s total=%s keys=%s" % (
+                step,
+                total_loss_val,
+                len(known_metric_keys),
+            )
+        )
+
+        return metrics_floats
+
+    def emit_tensorboard_scalars(
+        step: int,
+        total_loss_val: float,
+        metrics_floats: Dict[str, float],
+        *,
+        full: bool,
+        base: bool = True,
+    ) -> None:
+        if writer is None:
+            return
+
+        debug_log(
+            "tb_emit_invoke step=%s full=%s" % (
+                step,
+                full,
+            )
+        )
+
+        metrics_source = metrics_floats or {}
+
+        walltime_override: Optional[float] = None
+        if tensorboard_use_walltime:
+            elapsed_monotonic = max(time.perf_counter() - train_start_time, 0.0)
+            if tensorboard_use_elapsed:
+                walltime_override = train_start_wall + elapsed_monotonic
+            else:
+                walltime_override = time.time()
+
+        def _coerce_numeric(value: Optional[float]) -> Optional[float]:
+            if value is None:
+                return None
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(numeric):
+                return None
+            return numeric
+
+        def _add_scalar(tag: str, value: Optional[float]) -> None:
+            numeric = _coerce_numeric(value)
+            if numeric is None:
+                return
+            try:
+                if walltime_override is not None:
+                    writer.add_scalar(tag, numeric, step, walltime=walltime_override)
+                else:
+                    writer.add_scalar(tag, numeric, step)
+            except Exception as err:
+                debug_log(f"tb_scalar_error tag={tag} step={step} err={err}")
+
+        if base:
+            _add_scalar("_/heartbeat", 1.0)
+            _add_scalar("loss/total", total_loss_val)
+
+        if full:
+            for loss_key in ("color", "opacity", "depth"):
+                _add_scalar(f"loss/{loss_key}", metrics_source.get(loss_key))
+            for feature_key in ("feature_recon", "feature_cosine"):
+                _add_scalar(f"loss/{feature_key}", metrics_source.get(feature_key))
+
             scalar_map = {
                 "learning_rate": "train/learning_rate",
                 "opacity_target_weight_effective": "opacity/target_weight_effective",
@@ -3896,6 +4072,7 @@ def train(
                 "alpha_penalty_weight": "opacity/alpha_penalty_weight",
                 "alpha_guard_avg_penalty": "opacity/alpha_guard_avg",
                 "opacity_target_weight_base": "opacity/target_weight_base",
+                "opacity_target_weight_effective": "opacity/target_weight_effective",
                 "opacity_target_adjustment": "opacity/target_weight_adjustment",
                 "opacity_lambda_runtime": "opacity/lambda_runtime",
                 "feature_on_steps": "feature/on_steps",
@@ -3910,16 +4087,14 @@ def train(
                 "mask_prefail_variance": "feature_mask/prefail_variance",
             }
             for _, avg_key, tag in moving_average_specs:
-                if avg_key in loss_values:
-                    scalar_map[avg_key] = tag
-            for key, tag in scalar_map.items():
-                if key in loss_values:
-                    writer.add_scalar(tag, _to_float(loss_values[key]), step)
-            try:
-                writer.flush()
-            except Exception:
-                pass
+                scalar_map[avg_key] = tag
+            for metric_key, tb_tag in scalar_map.items():
+                _add_scalar(tb_tag, metrics_source.get(metric_key))
+
+        try:
             writer.flush()
+        except Exception as err:
+            debug_log(f"tb_flush_error step={step} err={err}")
 
     def snapshot_recent_metrics(rows: int = 1000) -> None:
         csv_path = logging_cfg.csv
@@ -4113,6 +4288,7 @@ def train(
 
     global_step = start_step
     train_start_time = time.perf_counter()
+    train_start_wall = time.time()
     progress_label = experiment.progress_desc or experiment.name or "response"
     if overfit_enabled and resolved_overfit_mode is not None:
         progress_label = f"{progress_label} overfit[{resolved_overfit_mode}]"
@@ -4476,6 +4652,8 @@ def train(
                 last_input_guard_notice = step_start_time
             global_step += 1
             debug_log(f"loop_step global_step={global_step}")
+            if global_step == start_step + 1:
+                progress.write(f"[debug_start] start_step={start_step}")
             update_phase_for_step(global_step)
             if train_cfg.max_steps > 0:
                 target_n = max(global_step - start_step, 0)
@@ -4671,7 +4849,7 @@ def train(
             loss_dict["alpha_band_penalty"] = alpha_band_component
             loss_dict["alpha_penalty_core"] = alpha_penalty_core
             loss_dict["alpha_penalty_weight"] = torch.tensor(alpha_penalty_weight, device=device)
-
+            debug_log("loss_ready step=%s" % (global_step,))
             penalty_scalar = float(alpha_penalty_core.detach().cpu().item())
             if len(alpha_guard_penalty_history) >= alpha_guard_window:
                 removed_penalty = alpha_guard_penalty_history.popleft()
@@ -4731,821 +4909,973 @@ def train(
                     _smooth_transition(alpha_penalty_weight, alpha_penalty_weight_target, alpha_guard_smoothing)
                 )
 
-        feature_breakdown = None
-        log_feature_mask_fraction: Optional[torch.Tensor] = None
-        feature_src_dim_value: Optional[int] = None
-        projector_out_dim_value: Optional[int] = None
-        feature_aux_loss_unscaled: Optional[torch.Tensor] = None
-        feature_aux_weight_value: float = 0.0
-        feature_aux_feature_dim_value: Optional[int] = None
-        if (
-            feature_pipeline_active
-            and feature_projector is not None
-            and feature_distiller is not None
-            and feature_distiller.enabled
-        ):
-            student_pre, _ = extract_student_features(
-                student_model,
-                source=feature_cfg.student_feature_source,
-                activation=feature_cfg.student_feature_activation,
-                dim=feature_cfg.student_feature_dim,
-            )
-            if student_pre is None:
-                if not student_feature_missing_warned:
-                    progress.write(
-                        "[feature_pipeline] student features unavailable for configured source; "
-                        "feature loss will be skipped until activations become available."
+            feature_breakdown = None
+            log_feature_mask_fraction: Optional[torch.Tensor] = None
+            feature_src_dim_value: Optional[int] = None
+            projector_out_dim_value: Optional[int] = None
+            feature_aux_loss_unscaled: Optional[torch.Tensor] = None
+            feature_aux_weight_value: float = 0.0
+            feature_aux_feature_dim_value: Optional[int] = None
+            if global_step <= start_step + 5:
+                debug_log(
+                    "log_feature_gate step=%s active=%s" % (
+                        global_step,
+                        feature_pipeline_active,
                     )
-                    student_feature_missing_warned = True
-            elif student_feature_missing_warned:
-                progress.write("[feature_pipeline] student features detected again; resuming feature losses when enabled.")
-                student_feature_missing_warned = False
-            feature_mask_fraction_value: Optional[float] = None
-            mask_threshold_for_log: Optional[float] = None
-            prefail_min_candidate: Optional[float] = None
-            prefail_p5_candidate: Optional[float] = None
-            prefail_variance_candidate: Optional[float] = None
-
-            if student_pre is not None and student_pre.numel() != 0:
-                try:
-                    student_pre = student_pre.view(
-                        student_rgb_samples.shape[0],
-                        data_cfg.samples_per_ray,
-                        student_pre.shape[-1],
-                    )
-                    expected_student_dim = getattr(feature_projector.cfg, "input_dim", None)
-                    if expected_student_dim is not None and student_pre.shape[-1] != expected_student_dim:
-                        raise RuntimeError(
-                            "student penultimate feature dimensionality mismatch: "
-                            f"expected {expected_student_dim}, got {student_pre.shape[-1]} at step {global_step}"
+                )
+            if (
+                feature_pipeline_active
+                and feature_projector is not None
+                and feature_distiller is not None
+                and feature_distiller.enabled
+            ):
+                student_pre, _ = extract_student_features(
+                    student_model,
+                    source=feature_cfg.student_feature_source,
+                    activation=feature_cfg.student_feature_activation,
+                    dim=feature_cfg.student_feature_dim,
+                )
+                if student_pre is None:
+                    if not student_feature_missing_warned:
+                        progress.write(
+                            "[feature_pipeline] student features unavailable for configured source; "
+                            "feature loss will be skipped until activations become available."
                         )
-                except RuntimeError:
-                    student_pre = None
-
-                if student_pre is not None:
-                    feature_src_dim_value = int(student_pre.shape[-1])
-                    last_feature_src_dim_logged = feature_src_dim_value
-                    projector_out_dim_value = int(feature_projector.cfg.output_dim)
-                    last_projector_out_dim_logged = projector_out_dim_value
-                    teacher_feature_tensor: Optional[torch.Tensor] = None
-                    student_projected: Optional[torch.Tensor] = None
-                    feature_mask_weights: Optional[torch.Tensor] = None
-                    feature_mask_fraction_tensor: Optional[torch.Tensor] = None
-                    feature_mask_weight_mean_tensor: Optional[torch.Tensor] = None
-                    feature_mask_weight_min_tensor: Optional[torch.Tensor] = None
-                    feature_mask_weight_max_tensor: Optional[torch.Tensor] = None
-                    skip_mask_updates = False
-                    mask_override_mode = (phase_mask_override or "inherit").lower()
-                    student_aux_base_features: Optional[torch.Tensor] = None
-
-                    gaussian_mode = feature_cfg.teacher_mode
-                    gaussian_enabled = (
-                        gaussian_cell_features is not None
-                        and (gaussian_mode.startswith("gaussian") or bool(feature_cfg.teacher_components))
-                    )
-
-                    if gaussian_enabled:
-                        impl = getattr(student_model, "impl", student_model)
-                        cell_indices = getattr(impl, "last_linear_indices", None)
-                        expected_samples = student_pre.numel() // student_pre.shape[-1]
-                        if (
-                            cell_indices is not None
-                            and cell_indices.numel() == expected_samples
-                        ):
-                            gaussian_features_device = gaussian_cell_features.to(
-                                device=device,
-                                dtype=student_pre.dtype,
+                        student_feature_missing_warned = True
+                elif student_feature_missing_warned:
+                    progress.write("[feature_pipeline] student features detected again; resuming feature losses when enabled.")
+                    student_feature_missing_warned = False
+                feature_mask_fraction_value: Optional[float] = None
+                mask_threshold_for_log: Optional[float] = None
+                prefail_min_candidate: Optional[float] = None
+                prefail_p5_candidate: Optional[float] = None
+                prefail_variance_candidate: Optional[float] = None
+    
+                if student_pre is not None and student_pre.numel() != 0:
+                    try:
+                        student_pre = student_pre.view(
+                            student_rgb_samples.shape[0],
+                            data_cfg.samples_per_ray,
+                            student_pre.shape[-1],
+                        )
+                        expected_student_dim = getattr(feature_projector.cfg, "input_dim", None)
+                        if expected_student_dim is not None and student_pre.shape[-1] != expected_student_dim:
+                            raise RuntimeError(
+                                "student penultimate feature dimensionality mismatch: "
+                                f"expected {expected_student_dim}, got {student_pre.shape[-1]} at step {global_step}"
                             )
-
-                            cell_indices = cell_indices.to(device)
-                            cells_per_ray = cell_indices.view(
-                                student_rgb_samples.shape[0],
-                                data_cfg.samples_per_ray,
-                            )
-
-                            primary_sample = torch.argmax(weights, dim=-1)
-                            primary_cells = cells_per_ray.gather(
-                                -1, primary_sample.unsqueeze(-1)
-                            ).squeeze(-1)
-
-                            same_cell_mask = cells_per_ray == primary_cells.unsqueeze(-1)
-                            primary_weights = weights * same_cell_mask
-                            primary_weight_sum_raw = torch.sum(primary_weights, dim=-1)
-                            primary_weight_sum = primary_weight_sum_raw.unsqueeze(-1).clamp_min(1e-6)
-                            primary_weights_norm = primary_weights / primary_weight_sum
-
-                            zero_weight_mask = primary_weight_sum_raw <= 1e-6
-                            if torch.any(zero_weight_mask):
-                                same_cell_float = same_cell_mask.float()
-                                same_cell_count = same_cell_float.sum(dim=-1, keepdim=True).clamp_min(1.0)
-                                uniform_weights = same_cell_float / same_cell_count
-                                primary_weights_norm[zero_weight_mask] = uniform_weights[zero_weight_mask]
-                                primary_weight_sum_raw = primary_weight_sum_raw.masked_fill(
-                                    zero_weight_mask, 1.0
+                    except RuntimeError:
+                        student_pre = None
+    
+                    if student_pre is not None:
+                        feature_src_dim_value = int(student_pre.shape[-1])
+                        last_feature_src_dim_logged = feature_src_dim_value
+                        projector_out_dim_value = int(feature_projector.cfg.output_dim)
+                        last_projector_out_dim_logged = projector_out_dim_value
+                        teacher_feature_tensor: Optional[torch.Tensor] = None
+                        student_projected: Optional[torch.Tensor] = None
+                        feature_mask_weights: Optional[torch.Tensor] = None
+                        feature_mask_fraction_tensor: Optional[torch.Tensor] = None
+                        feature_mask_weight_mean_tensor: Optional[torch.Tensor] = None
+                        feature_mask_weight_min_tensor: Optional[torch.Tensor] = None
+                        feature_mask_weight_max_tensor: Optional[torch.Tensor] = None
+                        skip_mask_updates = False
+                        mask_override_mode = (phase_mask_override or "inherit").lower()
+                        student_aux_base_features: Optional[torch.Tensor] = None
+    
+                        gaussian_mode = feature_cfg.teacher_mode
+                        gaussian_enabled = (
+                            gaussian_cell_features is not None
+                            and (gaussian_mode.startswith("gaussian") or bool(feature_cfg.teacher_components))
+                        )
+    
+                        if gaussian_enabled:
+                            impl = getattr(student_model, "impl", student_model)
+                            cell_indices = getattr(impl, "last_linear_indices", None)
+                            expected_samples = student_pre.numel() // student_pre.shape[-1]
+                            if (
+                                cell_indices is not None
+                                and cell_indices.numel() == expected_samples
+                            ):
+                                gaussian_features_device = gaussian_cell_features.to(
+                                    device=device,
+                                    dtype=student_pre.dtype,
                                 )
-
-                            primary_weight_sum_raw = primary_weight_sum_raw.clamp_min(1e-2)
-
-                            if mask_prefail_enabled:
-                                try:
-                                    prefail_min_candidate = float(
-                                        primary_weight_sum_raw.min().detach().cpu().item()
+    
+                                cell_indices = cell_indices.to(device)
+                                cells_per_ray = cell_indices.view(
+                                    student_rgb_samples.shape[0],
+                                    data_cfg.samples_per_ray,
+                                )
+    
+                                primary_sample = torch.argmax(weights, dim=-1)
+                                primary_cells = cells_per_ray.gather(
+                                    -1, primary_sample.unsqueeze(-1)
+                                ).squeeze(-1)
+    
+                                same_cell_mask = cells_per_ray == primary_cells.unsqueeze(-1)
+                                primary_weights = weights * same_cell_mask
+                                primary_weight_sum_raw = torch.sum(primary_weights, dim=-1)
+                                primary_weight_sum = primary_weight_sum_raw.unsqueeze(-1).clamp_min(1e-6)
+                                primary_weights_norm = primary_weights / primary_weight_sum
+    
+                                zero_weight_mask = primary_weight_sum_raw <= 1e-6
+                                if torch.any(zero_weight_mask):
+                                    same_cell_float = same_cell_mask.float()
+                                    same_cell_count = same_cell_float.sum(dim=-1, keepdim=True).clamp_min(1.0)
+                                    uniform_weights = same_cell_float / same_cell_count
+                                    primary_weights_norm[zero_weight_mask] = uniform_weights[zero_weight_mask]
+                                    primary_weight_sum_raw = primary_weight_sum_raw.masked_fill(
+                                        zero_weight_mask, 1.0
                                     )
-                                except (RuntimeError, ValueError):
-                                    prefail_min_candidate = None
-                                prefail_p5_tensor: Optional[torch.Tensor] = None
-                                try:
-                                    prefail_p5_tensor = torch.quantile(primary_weight_sum_raw, 0.05)
-                                except RuntimeError:
-                                    flattened = primary_weight_sum_raw.view(-1)
-                                    if flattened.numel() > 0:
-                                        k_index = max(int(math.floor(0.05 * (flattened.numel() - 1))), 0)
-                                        sorted_vals, _ = torch.sort(flattened)
-                                        prefail_p5_tensor = sorted_vals[k_index : k_index + 1].mean()
-                                if prefail_p5_tensor is not None:
+    
+                                primary_weight_sum_raw = primary_weight_sum_raw.clamp_min(1e-2)
+    
+                                if mask_prefail_enabled:
                                     try:
-                                        prefail_p5_candidate = float(prefail_p5_tensor.detach().cpu().item())
+                                        prefail_min_candidate = float(
+                                            primary_weight_sum_raw.min().detach().cpu().item()
+                                        )
                                     except (RuntimeError, ValueError):
-                                        prefail_p5_candidate = None
-                                if primary_weight_sum_raw.numel() > 1:
+                                        prefail_min_candidate = None
+                                    prefail_p5_tensor: Optional[torch.Tensor] = None
                                     try:
-                                        variance_tensor = torch.var(primary_weight_sum_raw, unbiased=False)
+                                        prefail_p5_tensor = torch.quantile(primary_weight_sum_raw, 0.05)
                                     except RuntimeError:
-                                        variance_tensor = None
-                                else:
-                                    variance_tensor = torch.zeros((), device=primary_weight_sum_raw.device)
-                                if variance_tensor is not None:
-                                    try:
-                                        prefail_variance_candidate = float(variance_tensor.detach().cpu().item())
-                                    except (RuntimeError, ValueError):
-                                        prefail_variance_candidate = None
-
-                            feature_mask_weight_mean_tensor = primary_weight_sum_raw.mean()
-                            feature_mask_weight_min_tensor = primary_weight_sum_raw.min()
-                            feature_mask_weight_max_tensor = primary_weight_sum_raw.max()
-
-                            gathered = gaussian_features_device.index_select(0, cell_indices)
-                            gathered = gathered.view(
-                                student_rgb_samples.shape[0],
-                                data_cfg.samples_per_ray,
-                                gathered.shape[-1],
-                            )
-
-                            teacher_feature_tensor = torch.sum(
-                                primary_weights_norm[..., None] * gathered,
-                                dim=-2,
-                            )
-
-                            student_cell_features = torch.sum(
-                                primary_weights_norm[..., None] * student_pre,
-                                dim=-2,
-                            )
-
-                            student_aux_base_features = student_cell_features
-
-                            student_projected = feature_projector(student_cell_features)
-                            threshold_source = mask_controller.current_threshold(global_step) if mask_controller else feature_cfg.boundary_mask_threshold
-                            if mask_override_mode in {"disabled", "off", "full"}:
-                                feature_mask_weights = torch.ones_like(primary_weight_sum_raw, device=student_projected.device)
-                                feature_mask_fraction_tensor = torch.tensor(1.0, device=student_projected.device)
-                                mask_threshold_for_log = float("nan")
-                                skip_mask_updates = True
-                            elif threshold_source is not None:
-                                boundary_threshold = float(threshold_source)
-                                soft_transition = max(
-                                    mask_controller.current_soft_transition() if mask_controller else float(feature_cfg.boundary_mask_soft_transition),
-                                    0.0,
+                                        flattened = primary_weight_sum_raw.view(-1)
+                                        if flattened.numel() > 0:
+                                            k_index = max(int(math.floor(0.05 * (flattened.numel() - 1))), 0)
+                                            sorted_vals, _ = torch.sort(flattened)
+                                            prefail_p5_tensor = sorted_vals[k_index : k_index + 1].mean()
+                                    if prefail_p5_tensor is not None:
+                                        try:
+                                            prefail_p5_candidate = float(prefail_p5_tensor.detach().cpu().item())
+                                        except (RuntimeError, ValueError):
+                                            prefail_p5_candidate = None
+                                    if primary_weight_sum_raw.numel() > 1:
+                                        try:
+                                            variance_tensor = torch.var(primary_weight_sum_raw, unbiased=False)
+                                        except RuntimeError:
+                                            variance_tensor = None
+                                    else:
+                                        variance_tensor = torch.zeros((), device=primary_weight_sum_raw.device)
+                                    if variance_tensor is not None:
+                                        try:
+                                            prefail_variance_candidate = float(variance_tensor.detach().cpu().item())
+                                        except (RuntimeError, ValueError):
+                                            prefail_variance_candidate = None
+    
+                                feature_mask_weight_mean_tensor = primary_weight_sum_raw.mean()
+                                feature_mask_weight_min_tensor = primary_weight_sum_raw.min()
+                                feature_mask_weight_max_tensor = primary_weight_sum_raw.max()
+    
+                                gathered = gaussian_features_device.index_select(0, cell_indices)
+                                gathered = gathered.view(
+                                    student_rgb_samples.shape[0],
+                                    data_cfg.samples_per_ray,
+                                    gathered.shape[-1],
                                 )
-                                soft_mode = feature_cfg.boundary_mask_soft_mode
-                                floor = feature_cfg.boundary_mask_soft_floor
-                                if soft_mode == "sigmoid":
-                                    scale = max(soft_transition, 1e-6)
-                                    logits = (primary_weight_sum_raw - boundary_threshold) / scale
-                                    weights = torch.sigmoid(logits)
-                                    if floor > 0.0:
-                                        weights = weights * (1.0 - floor) + floor
-                                    feature_mask_weights = weights
-                                elif soft_mode in {"smooth", "smoothstep"} and soft_transition > 0.0:
-                                    lower = boundary_threshold - soft_transition
-                                    upper = boundary_threshold + soft_transition
-                                    denom = max(upper - lower, 1e-6)
-                                    t = ((primary_weight_sum_raw - lower) / denom).clamp(0.0, 1.0)
-                                    weights = t * t * (3.0 - 2.0 * t)
-                                    if floor > 0.0:
-                                        weights = weights * (1.0 - floor) + floor
-                                    feature_mask_weights = weights
-                                elif soft_transition > 0.0:
-                                    lower = boundary_threshold - soft_transition
-                                    transition = max(soft_transition, 1e-6)
-                                    weights = (primary_weight_sum_raw - lower) / transition
-                                    weights = torch.clamp(weights, 0.0, 1.0)
-                                    if floor > 0.0:
-                                        weights = weights * (1.0 - floor) + floor
-                                    feature_mask_weights = weights
+    
+                                teacher_feature_tensor = torch.sum(
+                                    primary_weights_norm[..., None] * gathered,
+                                    dim=-2,
+                                )
+    
+                                student_cell_features = torch.sum(
+                                    primary_weights_norm[..., None] * student_pre,
+                                    dim=-2,
+                                )
+    
+                                student_aux_base_features = student_cell_features
+    
+                                student_projected = feature_projector(student_cell_features)
+                                threshold_source = mask_controller.current_threshold(global_step) if mask_controller else feature_cfg.boundary_mask_threshold
+                                if mask_override_mode in {"disabled", "off", "full"}:
+                                    feature_mask_weights = torch.ones_like(primary_weight_sum_raw, device=student_projected.device)
+                                    feature_mask_fraction_tensor = torch.tensor(1.0, device=student_projected.device)
+                                    mask_threshold_for_log = float("nan")
+                                    skip_mask_updates = True
+                                elif threshold_source is not None:
+                                    boundary_threshold = float(threshold_source)
+                                    soft_transition = max(
+                                        mask_controller.current_soft_transition() if mask_controller else float(feature_cfg.boundary_mask_soft_transition),
+                                        0.0,
+                                    )
+                                    soft_mode = feature_cfg.boundary_mask_soft_mode
+                                    floor = feature_cfg.boundary_mask_soft_floor
+                                    if soft_mode == "sigmoid":
+                                        scale = max(soft_transition, 1e-6)
+                                        logits = (primary_weight_sum_raw - boundary_threshold) / scale
+                                        weights = torch.sigmoid(logits)
+                                        if floor > 0.0:
+                                            weights = weights * (1.0 - floor) + floor
+                                        feature_mask_weights = weights
+                                    elif soft_mode in {"smooth", "smoothstep"} and soft_transition > 0.0:
+                                        lower = boundary_threshold - soft_transition
+                                        upper = boundary_threshold + soft_transition
+                                        denom = max(upper - lower, 1e-6)
+                                        t = ((primary_weight_sum_raw - lower) / denom).clamp(0.0, 1.0)
+                                        weights = t * t * (3.0 - 2.0 * t)
+                                        if floor > 0.0:
+                                            weights = weights * (1.0 - floor) + floor
+                                        feature_mask_weights = weights
+                                    elif soft_transition > 0.0:
+                                        lower = boundary_threshold - soft_transition
+                                        transition = max(soft_transition, 1e-6)
+                                        weights = (primary_weight_sum_raw - lower) / transition
+                                        weights = torch.clamp(weights, 0.0, 1.0)
+                                        if floor > 0.0:
+                                            weights = weights * (1.0 - floor) + floor
+                                        feature_mask_weights = weights
+                                    else:
+                                        weights = (primary_weight_sum_raw >= boundary_threshold).float()
+                                        if floor > 0.0:
+                                            weights = weights * (1.0 - floor) + floor
+                                        feature_mask_weights = weights
+                                    feature_mask_weights = feature_mask_weights.to(student_projected.device)
+                                    feature_mask_weights = torch.clamp(feature_mask_weights, 0.0, 1.0)
+                                    feature_mask_fraction_tensor = feature_mask_weights.mean()
+                                    mask_threshold_for_log = boundary_threshold
                                 else:
-                                    weights = (primary_weight_sum_raw >= boundary_threshold).float()
-                                    if floor > 0.0:
-                                        weights = weights * (1.0 - floor) + floor
-                                    feature_mask_weights = weights
-                                feature_mask_weights = feature_mask_weights.to(student_projected.device)
-                                feature_mask_weights = torch.clamp(feature_mask_weights, 0.0, 1.0)
-                                feature_mask_fraction_tensor = feature_mask_weights.mean()
-                                mask_threshold_for_log = boundary_threshold
+                                    feature_mask_weights = None
+                                    feature_mask_fraction_tensor = None
                             else:
+                                gaussian_enabled = False
+                                if not gaussian_feature_warning_emitted:
+                                    print(
+                                        "[feature_pipeline] Unable to align Gaussian features with student cells; "
+                                        "falling back to RGB supervision for this step."
+                                    )
+                                    gaussian_feature_warning_emitted = True
+    
+                        if not gaussian_enabled:
+                            weighted_features = torch.sum(weights[..., None] * student_pre, dim=-2)
+                            student_aux_base_features = weighted_features
+                            student_projected = feature_projector(weighted_features)
+                            if student_projected.shape[-1] == teacher_rgb.shape[-1]:
+                                teacher_feature_tensor = teacher_rgb
+                            else:
+                                teacher_feature_tensor = None
                                 feature_mask_weights = None
                                 feature_mask_fraction_tensor = None
-                        else:
-                            gaussian_enabled = False
-                            if not gaussian_feature_warning_emitted:
-                                print(
-                                    "[feature_pipeline] Unable to align Gaussian features with student cells; "
-                                    "falling back to RGB supervision for this step."
-                                )
-                                gaussian_feature_warning_emitted = True
-
-                    if not gaussian_enabled:
-                        weighted_features = torch.sum(weights[..., None] * student_pre, dim=-2)
-                        student_aux_base_features = weighted_features
-                        student_projected = feature_projector(weighted_features)
-                        if student_projected.shape[-1] == teacher_rgb.shape[-1]:
-                            teacher_feature_tensor = teacher_rgb
-                        else:
-                            teacher_feature_tensor = None
-                            feature_mask_weights = None
-                            feature_mask_fraction_tensor = None
-
-                    if not gaussian_enabled and mask_override_mode in {"disabled", "off", "full"}:
-                        skip_mask_updates = True
-                        mask_threshold_for_log = float("nan")
-                        feature_mask_fraction_tensor = torch.tensor(
-                            1.0,
-                            device=student_projected.device if student_projected is not None else device,
-                        )
-
-                    if student_projected is not None and student_feature_adapter is not None:
-                        expected_in = student_feature_adapter.cfg.input_dim
-                        if student_projected.shape[-1] != expected_in:
-                            if not student_adapter_warned:
-                                print(
-                                    "[feature_pipeline] student adapter input mismatch: "
-                                    f"expected {expected_in}, got {student_projected.shape[-1]}; skipping adaptation."
-                                )
-                                student_adapter_warned = True
-                        else:
-                            student_projected = student_feature_adapter(student_projected)
-
-                    if teacher_feature_tensor is not None and teacher_feature_adapter is not None:
-                        expected_teacher_in = teacher_feature_adapter.cfg.input_dim
-                        if teacher_feature_tensor.shape[-1] != expected_teacher_in:
-                            if not teacher_adapter_warned:
-                                print(
-                                    "[feature_pipeline] teacher adapter input mismatch: "
-                                    f"expected {expected_teacher_in}, got {teacher_feature_tensor.shape[-1]}; skipping adaptation."
-                                )
-                                teacher_adapter_warned = True
-                        else:
-                            teacher_feature_tensor = teacher_feature_adapter(teacher_feature_tensor)
-
-                    if feature_aux_enabled:
-                        aux_weight = _compute_aux_weight(feature_aux_cfg, global_step)
-                        feature_aux_weight_value = float(aux_weight)
-                        if aux_weight > 0.0:
-                            aux_tensor: Optional[torch.Tensor] = None
-                            aux_source_key = (feature_aux_cfg.source or "penultimate_post").lower()
-
-                            if aux_source_key in {
-                                "projector",
-                                "projected",
-                                "projector_out",
-                                "student_projected",
-                                "student_head",
-                                "adapter",
-                            }:
-                                aux_tensor = student_projected
-                            elif aux_source_key in {
-                                "penultimate",
-                                "penultimate_post",
-                                "penultimate_pre",
-                                "hidden",
-                                "hidden_post",
-                                "hidden_pre",
-                                "student_pre",
-                                "student_hidden",
-                                "cell",
-                                "cells",
-                                "primary",
-                            }:
-                                aux_tensor = student_aux_base_features
-                            if (
-                                aux_tensor is None
-                                and aux_source_key
-                                not in {
+    
+                        if not gaussian_enabled and mask_override_mode in {"disabled", "off", "full"}:
+                            skip_mask_updates = True
+                            mask_threshold_for_log = float("nan")
+                            feature_mask_fraction_tensor = torch.tensor(
+                                1.0,
+                                device=student_projected.device if student_projected is not None else device,
+                            )
+    
+                        if student_projected is not None and student_feature_adapter is not None:
+                            expected_in = student_feature_adapter.cfg.input_dim
+                            if student_projected.shape[-1] != expected_in:
+                                if not student_adapter_warned:
+                                    print(
+                                        "[feature_pipeline] student adapter input mismatch: "
+                                        f"expected {expected_in}, got {student_projected.shape[-1]}; skipping adaptation."
+                                    )
+                                    student_adapter_warned = True
+                            else:
+                                student_projected = student_feature_adapter(student_projected)
+    
+                        if teacher_feature_tensor is not None and teacher_feature_adapter is not None:
+                            expected_teacher_in = teacher_feature_adapter.cfg.input_dim
+                            if teacher_feature_tensor.shape[-1] != expected_teacher_in:
+                                if not teacher_adapter_warned:
+                                    print(
+                                        "[feature_pipeline] teacher adapter input mismatch: "
+                                        f"expected {expected_teacher_in}, got {teacher_feature_tensor.shape[-1]}; skipping adaptation."
+                                    )
+                                    teacher_adapter_warned = True
+                            else:
+                                teacher_feature_tensor = teacher_feature_adapter(teacher_feature_tensor)
+    
+                        if feature_aux_enabled:
+                            aux_weight = _compute_aux_weight(feature_aux_cfg, global_step)
+                            feature_aux_weight_value = float(aux_weight)
+                            if aux_weight > 0.0:
+                                aux_tensor: Optional[torch.Tensor] = None
+                                aux_source_key = (feature_aux_cfg.source or "penultimate_post").lower()
+    
+                                if aux_source_key in {
                                     "projector",
                                     "projected",
                                     "projector_out",
                                     "student_projected",
                                     "student_head",
                                     "adapter",
-                                }
-                            ):
-                                aux_raw, _ = extract_student_features(
-                                    student_model,
-                                    source=feature_aux_cfg.source,
-                                )
-                                if aux_raw is not None:
-                                    if (
-                                        aux_raw.dim() == 2
-                                        and aux_raw.shape[0]
-                                        == student_rgb_samples.shape[0] * data_cfg.samples_per_ray
-                                    ):
-                                        aux_tensor = aux_raw.view(
-                                            student_rgb_samples.shape[0],
-                                            data_cfg.samples_per_ray,
-                                            aux_raw.shape[-1],
-                                        )
-                                        aux_tensor = torch.sum(weights[..., None] * aux_tensor, dim=-2)
-                                    elif aux_raw.dim() == 2 and aux_raw.shape[0] == student_rgb_samples.shape[0]:
-                                        aux_tensor = aux_raw
-                                    else:
-                                        aux_tensor = aux_raw
-
-                            if aux_tensor is None or aux_tensor.numel() == 0:
-                                if not feature_aux_source_warned:
-                                    print(
-                                        f"[feature_aux] Unable to resolve auxiliary features for source '{feature_aux_cfg.source}'; skipping loss until available.",
-                                        flush=True,
+                                }:
+                                    aux_tensor = student_projected
+                                elif aux_source_key in {
+                                    "penultimate",
+                                    "penultimate_post",
+                                    "penultimate_pre",
+                                    "hidden",
+                                    "hidden_post",
+                                    "hidden_pre",
+                                    "student_pre",
+                                    "student_hidden",
+                                    "cell",
+                                    "cells",
+                                    "primary",
+                                }:
+                                    aux_tensor = student_aux_base_features
+                                if (
+                                    aux_tensor is None
+                                    and aux_source_key
+                                    not in {
+                                        "projector",
+                                        "projected",
+                                        "projector_out",
+                                        "student_projected",
+                                        "student_head",
+                                        "adapter",
+                                    }
+                                ):
+                                    aux_raw, _ = extract_student_features(
+                                        student_model,
+                                        source=feature_aux_cfg.source,
                                     )
-                                    feature_aux_source_warned = True
-                            else:
-                                if aux_tensor.dim() >= 3:
-                                    aux_tensor = aux_tensor.reshape(aux_tensor.shape[0], -1)
-                                if aux_tensor.dim() != 2:
+                                    if aux_raw is not None:
+                                        if (
+                                            aux_raw.dim() == 2
+                                            and aux_raw.shape[0]
+                                            == student_rgb_samples.shape[0] * data_cfg.samples_per_ray
+                                        ):
+                                            aux_tensor = aux_raw.view(
+                                                student_rgb_samples.shape[0],
+                                                data_cfg.samples_per_ray,
+                                                aux_raw.shape[-1],
+                                            )
+                                            aux_tensor = torch.sum(weights[..., None] * aux_tensor, dim=-2)
+                                        elif aux_raw.dim() == 2 and aux_raw.shape[0] == student_rgb_samples.shape[0]:
+                                            aux_tensor = aux_raw
+                                        else:
+                                            aux_tensor = aux_raw
+    
+                                if aux_tensor is None or aux_tensor.numel() == 0:
                                     if not feature_aux_source_warned:
                                         print(
-                                            f"[feature_aux] Expected 2D tensor for auxiliary loss, got shape {tuple(aux_tensor.shape)}; skipping.",
+                                            f"[feature_aux] Unable to resolve auxiliary features for source '{feature_aux_cfg.source}'; skipping loss until available.",
                                             flush=True,
                                         )
                                         feature_aux_source_warned = True
                                 else:
-                                    aux_mask_tensor = feature_mask_weights
-                                    patch_loss = _compute_patch_cosine_loss(
-                                        aux_tensor,
-                                        mask=aux_mask_tensor,
-                                        patch_size=int(feature_aux_cfg.patch_rays),
-                                        stride=int(feature_aux_cfg.patch_stride),
-                                        normalize_mode=feature_aux_cfg.normalize,
-                                    )
-                                    feature_aux_loss_unscaled = patch_loss.detach()
-                                    feature_aux_feature_dim_value = int(aux_tensor.shape[-1])
-                                    loss_aux_weight = torch.tensor(
-                                        aux_weight,
-                                        device=patch_loss.device,
-                                        dtype=patch_loss.dtype,
-                                    )
-                                    weighted_aux_loss = patch_loss * loss_aux_weight
-                                    total_loss = total_loss + weighted_aux_loss
-                                    loss_dict["feature_aux"] = weighted_aux_loss
-
-                    if teacher_feature_tensor is not None and student_projected is not None:
-                        teacher_feature_tensor = teacher_feature_tensor.to(
-                            device=student_projected.device,
-                            dtype=student_projected.dtype,
-                        )
-                        feature_breakdown_raw = feature_distiller(
-                            {"primary": teacher_feature_tensor.detach()},
-                            {"primary": student_projected},
-                            mask=feature_mask_weights,
-                            global_step=global_step,
-                        )
-                        if phase_feature_loss_scale != 1.0:
-                            feature_breakdown = FeatureLossBreakdown(
-                                recon=feature_breakdown_raw.recon * phase_feature_loss_scale,
-                                cosine=feature_breakdown_raw.cosine * phase_feature_loss_scale,
-                                total=feature_breakdown_raw.total * phase_feature_loss_scale,
+                                    if aux_tensor.dim() >= 3:
+                                        aux_tensor = aux_tensor.reshape(aux_tensor.shape[0], -1)
+                                    if aux_tensor.dim() != 2:
+                                        if not feature_aux_source_warned:
+                                            print(
+                                                f"[feature_aux] Expected 2D tensor for auxiliary loss, got shape {tuple(aux_tensor.shape)}; skipping.",
+                                                flush=True,
+                                            )
+                                            feature_aux_source_warned = True
+                                    else:
+                                        aux_mask_tensor = feature_mask_weights
+                                        patch_loss = _compute_patch_cosine_loss(
+                                            aux_tensor,
+                                            mask=aux_mask_tensor,
+                                            patch_size=int(feature_aux_cfg.patch_rays),
+                                            stride=int(feature_aux_cfg.patch_stride),
+                                            normalize_mode=feature_aux_cfg.normalize,
+                                        )
+                                        feature_aux_loss_unscaled = patch_loss.detach()
+                                        feature_aux_feature_dim_value = int(aux_tensor.shape[-1])
+                                        loss_aux_weight = torch.tensor(
+                                            aux_weight,
+                                            device=patch_loss.device,
+                                            dtype=patch_loss.dtype,
+                                        )
+                                        weighted_aux_loss = patch_loss * loss_aux_weight
+                                        total_loss = total_loss + weighted_aux_loss
+                                        loss_dict["feature_aux"] = weighted_aux_loss
+    
+                        if teacher_feature_tensor is not None and student_projected is not None:
+                            teacher_feature_tensor = teacher_feature_tensor.to(
+                                device=student_projected.device,
+                                dtype=student_projected.dtype,
                             )
-                        else:
-                            feature_breakdown = feature_breakdown_raw
-                        if feature_breakdown.total.requires_grad:
-                            total_loss = total_loss + feature_breakdown.total
-                            loss_dict["feature"] = feature_breakdown.total
-                        if feature_mask_fraction_tensor is not None:
-                            log_feature_mask_fraction = feature_mask_fraction_tensor.detach()
-                            feature_mask_fraction_value = float(log_feature_mask_fraction.item())
-                            last_feature_mask_fraction_value = feature_mask_fraction_value
-                            if mask_controller is not None and not skip_mask_updates:
-                                mask_controller.observe(global_step, feature_mask_fraction_value)
-                                if (
-                                    mask_controller_activation_step is not None
-                                    and global_step >= mask_controller_activation_step
-                                ):
-                                    emergency_fraction = mask_emergency_fraction
-                                    recovery_fraction = mask_recovery_fraction
-
-                                    if feature_mask_fraction_value < mask_low_fraction_threshold:
-                                        mask_low_fraction_streak += 1
-                                        mask_emergency_release_counter = 0
-                                    else:
-                                        mask_low_fraction_streak = 0
-                                        if mask_emergency_active_flag:
-                                            if feature_mask_fraction_value >= recovery_fraction:
-                                                mask_emergency_release_counter = min(
-                                                    mask_emergency_release_counter + 1,
-                                                    mask_emergency_hold_steps,
-                                                )
-                                            else:
-                                                mask_emergency_release_counter = 0
-
+                            feature_breakdown_raw = feature_distiller(
+                                {"primary": teacher_feature_tensor.detach()},
+                                {"primary": student_projected},
+                                mask=feature_mask_weights,
+                                global_step=global_step,
+                            )
+                            if phase_feature_loss_scale != 1.0:
+                                feature_breakdown = FeatureLossBreakdown(
+                                    recon=feature_breakdown_raw.recon * phase_feature_loss_scale,
+                                    cosine=feature_breakdown_raw.cosine * phase_feature_loss_scale,
+                                    total=feature_breakdown_raw.total * phase_feature_loss_scale,
+                                )
+                            else:
+                                feature_breakdown = feature_breakdown_raw
+                            if feature_breakdown.total.requires_grad:
+                                total_loss = total_loss + feature_breakdown.total
+                                loss_dict["feature"] = feature_breakdown.total
+                            if feature_mask_fraction_tensor is not None:
+                                log_feature_mask_fraction = feature_mask_fraction_tensor.detach()
+                                feature_mask_fraction_value = float(log_feature_mask_fraction.item())
+                                last_feature_mask_fraction_value = feature_mask_fraction_value
+                                if mask_controller is not None and not skip_mask_updates:
+                                    mask_controller.observe(global_step, feature_mask_fraction_value)
                                     if (
-                                        not mask_emergency_active_flag
-                                        and mask_low_fraction_streak >= mask_low_fraction_required_steps
+                                        mask_controller_activation_step is not None
+                                        and global_step >= mask_controller_activation_step
                                     ):
-                                        base_threshold = mask_controller.current_threshold(global_step)
-                                        if base_threshold is None:
-                                            base_threshold = mask_controller.base_threshold
-                                        if base_threshold is None:
-                                            mask_controller.force_minimum()
+                                        emergency_fraction = mask_emergency_fraction
+                                        recovery_fraction = mask_recovery_fraction
+    
+                                        if feature_mask_fraction_value < mask_low_fraction_threshold:
+                                            mask_low_fraction_streak += 1
+                                            mask_emergency_release_counter = 0
                                         else:
-                                            mask_controller.force_threshold(base_threshold * 0.8)
-                                        mask_emergency_active_flag = True
-                                        mask_emergency_activation_total += 1
-                                        mask_fraction_emergency_warned = True
-                                        progress.write(
-                                            (
-                                                "[feature_pipeline] Mask coverage stayed below "
-                                                f"{mask_low_fraction_threshold:.2f} for {mask_low_fraction_required_steps} steps; "
-                                                "relaxing threshold temporarily."
-                                            )
-                                        )
-
-                                    if mask_emergency_active_flag:
-                                        if feature_mask_fraction_value < emergency_fraction:
-                                            mask_controller.force_minimum()
-                                            mask_emergency_release_counter = 0
-                                        elif mask_emergency_release_counter >= mask_emergency_hold_steps:
-                                            mask_controller.relax_towards_schedule(
-                                                global_step,
-                                                immediate=True,
-                                            )
-                                            mask_emergency_active_flag = False
-                                            mask_fraction_emergency_warned = False
-                                            mask_emergency_release_counter = 0
-                                    else:
-                                        if feature_mask_fraction_value >= recovery_fraction:
-                                            if mask_fraction_emergency_warned:
-                                                progress.write(
-                                                    "[feature_pipeline] Mask coverage recovered; releasing emergency override."
+                                            mask_low_fraction_streak = 0
+                                            if mask_emergency_active_flag:
+                                                if feature_mask_fraction_value >= recovery_fraction:
+                                                    mask_emergency_release_counter = min(
+                                                        mask_emergency_release_counter + 1,
+                                                        mask_emergency_hold_steps,
+                                                    )
+                                                else:
+                                                    mask_emergency_release_counter = 0
+    
+                                        if (
+                                            not mask_emergency_active_flag
+                                            and mask_low_fraction_streak >= mask_low_fraction_required_steps
+                                        ):
+                                            base_threshold = mask_controller.current_threshold(global_step)
+                                            if base_threshold is None:
+                                                base_threshold = mask_controller.base_threshold
+                                            if base_threshold is None:
+                                                mask_controller.force_minimum()
+                                            else:
+                                                mask_controller.force_threshold(base_threshold * 0.8)
+                                            mask_emergency_active_flag = True
+                                            mask_emergency_activation_total += 1
+                                            mask_fraction_emergency_warned = True
+                                            progress.write(
+                                                (
+                                                    "[feature_pipeline] Mask coverage stayed below "
+                                                    f"{mask_low_fraction_threshold:.2f} for {mask_low_fraction_required_steps} steps; "
+                                                    "relaxing threshold temporarily."
                                                 )
+                                            )
+    
+                                        if mask_emergency_active_flag:
+                                            if feature_mask_fraction_value < emergency_fraction:
+                                                mask_controller.force_minimum()
+                                                mask_emergency_release_counter = 0
+                                            elif mask_emergency_release_counter >= mask_emergency_hold_steps:
+                                                mask_controller.relax_towards_schedule(
+                                                    global_step,
+                                                    immediate=True,
+                                                )
+                                                mask_emergency_active_flag = False
                                                 mask_fraction_emergency_warned = False
-                                            mask_controller.relax_towards_schedule(
-                                                global_step,
-                                                immediate=True,
-                                            )
-                                        elif feature_mask_fraction_value >= mask_controller.min_fraction:
-                                            mask_controller.relax_towards_schedule(global_step)
-                                        mask_emergency_release_counter = 0
-
-                                if (
-                                    mask_prefail_enabled
-                                    and prefail_min_candidate is not None
-                                    and prefail_p5_candidate is not None
-                                ):
-                                    mask_prefail_history.append(
-                                        (global_step, float(prefail_min_candidate), float(prefail_p5_candidate))
-                                    )
-                                    p5_rate, min_rate = compute_mask_prefail_rates(mask_prefail_history)
-                                    if p5_rate is not None:
-                                        mask_prefail_drop_rate_recent = float(p5_rate)
-                                    if min_rate is not None:
-                                        mask_prefail_min_rate_recent = float(min_rate)
-                                    if prefail_variance_candidate is not None:
-                                        mask_prefail_variance_recent = float(prefail_variance_candidate)
-                                    trigger_prefail = False
-                                    cooldown_active = (
-                                        mask_prefail_cooldown_steps > 0 and global_step < mask_prefail_cooldown_until
-                                    )
-                                    if not mask_prefail_active_flag and not cooldown_active:
-                                        if (
-                                            p5_rate is not None
-                                            and p5_rate <= -float(mask_prefail_cfg.p5_drop_rate)
-                                        ):
-                                            trigger_prefail = True
-                                        if (
-                                            min_rate is not None
-                                            and min_rate <= -float(mask_prefail_cfg.min_drop_rate)
-                                        ):
-                                            trigger_prefail = True
-                                        variance_ceiling = float(mask_prefail_cfg.variance_ceiling)
-                                        if (
-                                            prefail_variance_candidate is not None
-                                            and variance_ceiling > 0.0
-                                            and prefail_variance_candidate >= variance_ceiling
-                                        ):
-                                            trigger_prefail = True
-                                    if trigger_prefail:
-                                        applied_threshold = None
-                                        if mask_controller is not None:
-                                            applied_threshold = mask_controller.apply_prefail(
-                                                global_step,
-                                                threshold_scale=float(mask_prefail_cfg.threshold_scale),
-                                                soft_delta=float(mask_prefail_cfg.soft_floor_delta),
-                                            )
-                                            mask_prefail_last_threshold = float(applied_threshold)
-                                        mask_prefail_active_flag = True
-                                        mask_prefail_trigger_step = global_step
-                                        mask_prefail_activation_total += 1
-                                        if mask_prefail_cooldown_steps > 0:
-                                            mask_prefail_cooldown_until = max(
-                                                mask_prefail_cooldown_until,
-                                                global_step + mask_prefail_cooldown_steps,
-                                            )
-                                        p5_desc = f"{p5_rate:.6f}" if p5_rate is not None else "nan"
-                                        min_desc = f"{min_rate:.6f}" if min_rate is not None else "nan"
-                                        thresh_desc = (
-                                            f"{mask_prefail_last_threshold:.4f}"
-                                            if math.isfinite(mask_prefail_last_threshold)
-                                            else "n/a"
+                                                mask_emergency_release_counter = 0
+                                        else:
+                                            if feature_mask_fraction_value >= recovery_fraction:
+                                                if mask_fraction_emergency_warned:
+                                                    progress.write(
+                                                        "[feature_pipeline] Mask coverage recovered; releasing emergency override."
+                                                    )
+                                                    mask_fraction_emergency_warned = False
+                                                mask_controller.relax_towards_schedule(
+                                                    global_step,
+                                                    immediate=True,
+                                                )
+                                            elif feature_mask_fraction_value >= mask_controller.min_fraction:
+                                                mask_controller.relax_towards_schedule(global_step)
+                                            mask_emergency_release_counter = 0
+    
+                                    if (
+                                        mask_prefail_enabled
+                                        and prefail_min_candidate is not None
+                                        and prefail_p5_candidate is not None
+                                    ):
+                                        mask_prefail_history.append(
+                                            (global_step, float(prefail_min_candidate), float(prefail_p5_candidate))
                                         )
-                                        progress.write(
-                                            "[feature_pipeline] Mask prefail trigger: "
-                                            f"p5_rate={p5_desc}, min_rate={min_desc}, threshold={thresh_desc}"
+                                        p5_rate, min_rate = compute_mask_prefail_rates(mask_prefail_history)
+                                        if p5_rate is not None:
+                                            mask_prefail_drop_rate_recent = float(p5_rate)
+                                        if min_rate is not None:
+                                            mask_prefail_min_rate_recent = float(min_rate)
+                                        if prefail_variance_candidate is not None:
+                                            mask_prefail_variance_recent = float(prefail_variance_candidate)
+                                        trigger_prefail = False
+                                        cooldown_active = (
+                                            mask_prefail_cooldown_steps > 0 and global_step < mask_prefail_cooldown_until
                                         )
-                                    elif mask_prefail_active_flag and mask_controller is not None:
-                                        release = False
-                                        if (
-                                            feature_mask_fraction_value is not None
-                                            and feature_mask_fraction_value >= mask_controller.min_fraction + 0.05
-                                        ):
-                                            release = True
-                                        elif p5_rate is not None and p5_rate >= -float(mask_prefail_cfg.p5_drop_rate) * 0.25:
-                                            release = True
-                                        if release and (global_step - mask_prefail_trigger_step) >= mask_prefail_window // 2:
-                                            mask_prefail_active_flag = False
-                                            mask_controller.relax_towards_schedule(global_step)
-                                            current_threshold = mask_controller.current_threshold(global_step)
-                                            if current_threshold is not None:
-                                                mask_prefail_last_threshold = float(current_threshold)
+                                        if not mask_prefail_active_flag and not cooldown_active:
+                                            if (
+                                                p5_rate is not None
+                                                and p5_rate <= -float(mask_prefail_cfg.p5_drop_rate)
+                                            ):
+                                                trigger_prefail = True
+                                            if (
+                                                min_rate is not None
+                                                and min_rate <= -float(mask_prefail_cfg.min_drop_rate)
+                                            ):
+                                                trigger_prefail = True
+                                            variance_ceiling = float(mask_prefail_cfg.variance_ceiling)
+                                            if (
+                                                prefail_variance_candidate is not None
+                                                and variance_ceiling > 0.0
+                                                and prefail_variance_candidate >= variance_ceiling
+                                            ):
+                                                trigger_prefail = True
+                                        if trigger_prefail:
+                                            applied_threshold = None
+                                            if mask_controller is not None:
+                                                applied_threshold = mask_controller.apply_prefail(
+                                                    global_step,
+                                                    threshold_scale=float(mask_prefail_cfg.threshold_scale),
+                                                    soft_delta=float(mask_prefail_cfg.soft_floor_delta),
+                                                )
+                                                mask_prefail_last_threshold = float(applied_threshold)
+                                            mask_prefail_active_flag = True
                                             mask_prefail_trigger_step = global_step
+                                            mask_prefail_activation_total += 1
                                             if mask_prefail_cooldown_steps > 0:
                                                 mask_prefail_cooldown_until = max(
                                                     mask_prefail_cooldown_until,
                                                     global_step + mask_prefail_cooldown_steps,
                                                 )
-
-        if feature_pipeline_active and "feature" not in loss_dict:
-            loss_dict["feature"] = torch.zeros((), device=device)
-        if feature_aux_enabled and "feature_aux" not in loss_dict:
-            loss_dict["feature_aux"] = torch.zeros((), device=device)
-
-        log_metrics: Dict[str, torch.Tensor] = dict(loss_dict)
-        log_metrics["metrics_schema_version"] = torch.tensor(float(METRICS_SCHEMA_VERSION), device=device)
-        log_metrics["opacity_target_weight_effective"] = torch.tensor(
-            opacity_target_weight_effective, device=device
-        )
-        log_metrics["opacity_target_weight_base"] = torch.tensor(opacity_target_weight_base, device=device)
-        log_metrics["opacity_target_adjustment"] = torch.tensor(opacity_target_adjustment, device=device)
-        log_metrics["opacity_lambda_runtime"] = torch.tensor(opacity_lambda_runtime, device=device)
-        log_metrics["learning_rate"] = torch.tensor(current_lr, device=device)
-        log_metrics["alpha_mean"] = alpha_mean_tensor.detach()
-        log_metrics["alpha_fraction_ge95"] = alpha_fraction_ge95.detach()
-        log_metrics["alpha_fraction_le05"] = alpha_fraction_le05.detach()
-        log_metrics["alpha_fraction_mid"] = alpha_fraction_mid.detach()
-        log_metrics["alpha_penalty_core"] = alpha_penalty_core.detach()
-        log_metrics["alpha_penalty_weight"] = torch.tensor(alpha_penalty_weight, device=device)
-        log_metrics["alpha_guard_avg_penalty"] = torch.tensor(alpha_guard_avg_penalty, device=device)
-        if feature_src_dim_value is not None:
-            log_metrics["feature_src_dim"] = torch.tensor(float(feature_src_dim_value), device=device)
-        if projector_out_dim_value is not None:
-            log_metrics["projector_out_dim"] = torch.tensor(float(projector_out_dim_value), device=device)
-        if feature_aux_enabled:
-            log_metrics["feature_aux_weight"] = torch.tensor(feature_aux_weight_value, device=device)
-            if feature_aux_loss_unscaled is not None:
-                log_metrics["feature_aux_loss_raw"] = feature_aux_loss_unscaled
-            else:
+                                            p5_desc = f"{p5_rate:.6f}" if p5_rate is not None else "nan"
+                                            min_desc = f"{min_rate:.6f}" if min_rate is not None else "nan"
+                                            thresh_desc = (
+                                                f"{mask_prefail_last_threshold:.4f}"
+                                                if math.isfinite(mask_prefail_last_threshold)
+                                                else "n/a"
+                                            )
+                                            progress.write(
+                                                "[feature_pipeline] Mask prefail trigger: "
+                                                f"p5_rate={p5_desc}, min_rate={min_desc}, threshold={thresh_desc}"
+                                            )
+                                        elif mask_prefail_active_flag and mask_controller is not None:
+                                            release = False
+                                            if (
+                                                feature_mask_fraction_value is not None
+                                                and feature_mask_fraction_value >= mask_controller.min_fraction + 0.05
+                                            ):
+                                                release = True
+                                            elif p5_rate is not None and p5_rate >= -float(mask_prefail_cfg.p5_drop_rate) * 0.25:
+                                                release = True
+                                            if release and (global_step - mask_prefail_trigger_step) >= mask_prefail_window // 2:
+                                                mask_prefail_active_flag = False
+                                                mask_controller.relax_towards_schedule(global_step)
+                                                current_threshold = mask_controller.current_threshold(global_step)
+                                                if current_threshold is not None:
+                                                    mask_prefail_last_threshold = float(current_threshold)
+                                                mask_prefail_trigger_step = global_step
+                                                if mask_prefail_cooldown_steps > 0:
+                                                    mask_prefail_cooldown_until = max(
+                                                        mask_prefail_cooldown_until,
+                                                        global_step + mask_prefail_cooldown_steps,
+                                                    )
+    
+            if feature_pipeline_active and "feature" not in loss_dict:
+                loss_dict["feature"] = torch.zeros((), device=device)
+            if feature_aux_enabled and "feature_aux" not in loss_dict:
+                loss_dict["feature_aux"] = torch.zeros((), device=device)
+    
+            if global_step <= start_step + 5:
+                debug_log("log_checkpoint_gate step=%s" % (global_step,))
+            debug_log("checkpoint_metrics step=%s" % (global_step,))
+    
+            log_metrics: Dict[str, torch.Tensor] = dict(loss_dict)
+            log_metrics["metrics_schema_version"] = torch.tensor(float(METRICS_SCHEMA_VERSION), device=device)
+            log_metrics["opacity_target_weight_effective"] = torch.tensor(
+                opacity_target_weight_effective, device=device
+            )
+            log_metrics["opacity_target_weight_base"] = torch.tensor(opacity_target_weight_base, device=device)
+            log_metrics["opacity_target_adjustment"] = torch.tensor(opacity_target_adjustment, device=device)
+            log_metrics["opacity_lambda_runtime"] = torch.tensor(opacity_lambda_runtime, device=device)
+            log_metrics["learning_rate"] = torch.tensor(current_lr, device=device)
+            log_metrics["alpha_mean"] = alpha_mean_tensor.detach()
+            log_metrics["alpha_fraction_ge95"] = alpha_fraction_ge95.detach()
+            log_metrics["alpha_fraction_le05"] = alpha_fraction_le05.detach()
+            log_metrics["alpha_fraction_mid"] = alpha_fraction_mid.detach()
+            log_metrics["alpha_penalty_core"] = alpha_penalty_core.detach()
+            log_metrics["alpha_penalty_weight"] = torch.tensor(alpha_penalty_weight, device=device)
+            log_metrics["alpha_guard_avg_penalty"] = torch.tensor(alpha_guard_avg_penalty, device=device)
+            if feature_src_dim_value is not None:
+                log_metrics["feature_src_dim"] = torch.tensor(float(feature_src_dim_value), device=device)
+            if projector_out_dim_value is not None:
+                log_metrics["projector_out_dim"] = torch.tensor(float(projector_out_dim_value), device=device)
+            if feature_aux_enabled:
+                log_metrics["feature_aux_weight"] = torch.tensor(feature_aux_weight_value, device=device)
+                if feature_aux_loss_unscaled is not None:
+                    log_metrics["feature_aux_loss_raw"] = feature_aux_loss_unscaled
+                else:
+                    log_metrics.setdefault(
+                        "feature_aux_loss_raw",
+                        torch.tensor(float("nan"), device=device),
+                    )
+                if feature_aux_feature_dim_value is not None:
+                    log_metrics["feature_aux_dim"] = torch.tensor(
+                        float(feature_aux_feature_dim_value),
+                        device=device,
+                    )
+            if feature_pipeline_active:
+                nan_default = torch.tensor(float("nan"), device=device)
+                log_metrics.setdefault("feature_recon", nan_default)
+                log_metrics.setdefault("feature_cosine", nan_default)
+                log_metrics.setdefault("feature_mask_fraction", nan_default)
                 log_metrics.setdefault(
-                    "feature_aux_loss_raw",
-                    torch.tensor(float("nan"), device=device),
+                    "feature_compare_teacher",
+                    torch.tensor(
+                        1.0 if str(feature_cfg.compare_space).lower() == "teacher" else 0.0,
+                        device=device,
+                    ),
                 )
-            if feature_aux_feature_dim_value is not None:
-                log_metrics["feature_aux_dim"] = torch.tensor(
-                    float(feature_aux_feature_dim_value),
-                    device=device,
+                log_metrics.setdefault(
+                    "feature_source_penultimate",
+                    torch.tensor(
+                        1.0 if str(feature_cfg.student_feature_source).lower() == "penultimate" else 0.0,
+                        device=device,
+                    ),
                 )
-        if feature_pipeline_active:
-            nan_default = torch.tensor(float("nan"), device=device)
-            log_metrics.setdefault("feature_recon", nan_default)
-            log_metrics.setdefault("feature_cosine", nan_default)
-            log_metrics.setdefault("feature_mask_fraction", nan_default)
-            log_metrics.setdefault(
-                "feature_compare_teacher",
-                torch.tensor(
-                    1.0 if str(feature_cfg.compare_space).lower() == "teacher" else 0.0,
-                    device=device,
-                ),
-            )
-            log_metrics.setdefault(
-                "feature_source_penultimate",
-                torch.tensor(
-                    1.0 if str(feature_cfg.student_feature_source).lower() == "penultimate" else 0.0,
-                    device=device,
-                ),
-            )
-            log_metrics.setdefault(
-                "feature_source_post_activation",
-                torch.tensor(
-                    1.0 if str(feature_cfg.student_feature_activation).lower() in {"post", "postrelu", "post_relu"} else 0.0,
-                    device=device,
-                ),
-            )
-            log_metrics.setdefault(
-                "feature_src_available",
-                torch.tensor(1.0 if student_pre is not None else 0.0, device=device),
-            )
-            if feature_mask_weight_mean_tensor is not None:
-                log_metrics["feature_mask_weight_mean"] = feature_mask_weight_mean_tensor.detach()
-                log_metrics["feature_mask_weight_min"] = feature_mask_weight_min_tensor.detach()
-                log_metrics["feature_mask_weight_max"] = feature_mask_weight_max_tensor.detach()
-            else:
-                log_metrics["feature_mask_weight_mean"] = nan_default
-                log_metrics["feature_mask_weight_min"] = nan_default
-                log_metrics["feature_mask_weight_max"] = nan_default
-            log_metrics["mask_emergency_active"] = torch.tensor(
-                1.0 if mask_emergency_active_flag else 0.0,
-                device=device,
-            )
-            log_metrics["mask_emergency_count"] = torch.tensor(
-                float(mask_emergency_activation_total),
-                device=device,
-            )
-            log_metrics["mask_low_fraction_streak"] = torch.tensor(
-                float(mask_low_fraction_streak),
-                device=device,
-            )
-            if mask_prefail_enabled:
-                log_metrics["mask_prefail_active"] = torch.tensor(
-                    1.0 if mask_prefail_active_flag else 0.0,
-                    device=device,
+                log_metrics.setdefault(
+                    "feature_source_post_activation",
+                    torch.tensor(
+                        1.0 if str(feature_cfg.student_feature_activation).lower() in {"post", "postrelu", "post_relu"} else 0.0,
+                        device=device,
+                    ),
                 )
-                log_metrics["mask_prefail_count"] = torch.tensor(
-                    float(mask_prefail_activation_total),
-                    device=device,
+                log_metrics.setdefault(
+                    "feature_src_available",
+                    torch.tensor(1.0 if student_pre is not None else 0.0, device=device),
                 )
-                log_metrics["mask_prefail_drop_rate"] = torch.tensor(
-                    mask_prefail_drop_rate_recent,
-                    device=device,
-                )
-                log_metrics["mask_prefail_min_rate"] = torch.tensor(
-                    mask_prefail_min_rate_recent,
-                    device=device,
-                )
-                log_metrics["mask_prefail_threshold"] = torch.tensor(
-                    mask_prefail_last_threshold,
-                    device=device,
-                )
-                log_metrics["mask_prefail_variance"] = torch.tensor(
-                    mask_prefail_variance_recent,
-                    device=device,
-                )
-            else:
-                log_metrics["mask_prefail_active"] = torch.tensor(0.0, device=device)
-                log_metrics["mask_prefail_count"] = torch.tensor(0.0, device=device)
-                log_metrics["mask_prefail_drop_rate"] = nan_default
-                log_metrics["mask_prefail_min_rate"] = nan_default
-                log_metrics["mask_prefail_threshold"] = nan_default
-                log_metrics["mask_prefail_variance"] = nan_default
-            if mask_controller is not None:
-                threshold_value = mask_threshold_for_log
-                if threshold_value is None:
-                    threshold_value = mask_controller.current_threshold(global_step)
-                if threshold_value is not None:
-                    log_metrics["feature_mask_threshold"] = torch.tensor(threshold_value, device=device)
+                if feature_mask_weight_mean_tensor is not None:
+                    log_metrics["feature_mask_weight_mean"] = feature_mask_weight_mean_tensor.detach()
+                    log_metrics["feature_mask_weight_min"] = feature_mask_weight_min_tensor.detach()
+                    log_metrics["feature_mask_weight_max"] = feature_mask_weight_max_tensor.detach()
                 else:
-                    log_metrics["feature_mask_threshold"] = nan_default
-                log_metrics["feature_mask_soft_transition"] = torch.tensor(
-                    mask_controller.current_soft_transition(),
+                    log_metrics["feature_mask_weight_mean"] = nan_default
+                    log_metrics["feature_mask_weight_min"] = nan_default
+                    log_metrics["feature_mask_weight_max"] = nan_default
+                log_metrics["mask_emergency_active"] = torch.tensor(
+                    1.0 if mask_emergency_active_flag else 0.0,
                     device=device,
                 )
-        if (
-            teacher_depth is not None
-            and loss_cfg.depth_weight > 0.0
-        ):
-            if depth_valid_fraction is None:
-                depth_valid_fraction = torch.tensor(float("nan"), device=device)
-            log_metrics["depth_valid_fraction"] = depth_valid_fraction
-            log_metrics.update(depth_stat_tensors)
-            if teacher_depth_for_loss is not None:
-                if (
-                    combined_valid_tensor is not None
-                    and combined_valid_tensor.any()
-                ):
-                    norm_values = teacher_depth_for_loss[combined_valid_tensor]
-                    log_metrics["teacher_depth_norm_min"] = norm_values.min()
-                    log_metrics["teacher_depth_norm_max"] = norm_values.max()
-                    log_metrics["teacher_depth_norm_mean"] = norm_values.mean()
+                log_metrics["mask_emergency_count"] = torch.tensor(
+                    float(mask_emergency_activation_total),
+                    device=device,
+                )
+                log_metrics["mask_low_fraction_streak"] = torch.tensor(
+                    float(mask_low_fraction_streak),
+                    device=device,
+                )
+                if mask_prefail_enabled:
+                    log_metrics["mask_prefail_active"] = torch.tensor(
+                        1.0 if mask_prefail_active_flag else 0.0,
+                        device=device,
+                    )
+                    log_metrics["mask_prefail_count"] = torch.tensor(
+                        float(mask_prefail_activation_total),
+                        device=device,
+                    )
+                    log_metrics["mask_prefail_drop_rate"] = torch.tensor(
+                        mask_prefail_drop_rate_recent,
+                        device=device,
+                    )
+                    log_metrics["mask_prefail_min_rate"] = torch.tensor(
+                        mask_prefail_min_rate_recent,
+                        device=device,
+                    )
+                    log_metrics["mask_prefail_threshold"] = torch.tensor(
+                        mask_prefail_last_threshold,
+                        device=device,
+                    )
+                    log_metrics["mask_prefail_variance"] = torch.tensor(
+                        mask_prefail_variance_recent,
+                        device=device,
+                    )
                 else:
-                    nan_tensor = torch.tensor(float("nan"), device=device)
-                    log_metrics["teacher_depth_norm_min"] = nan_tensor
-                    log_metrics["teacher_depth_norm_max"] = nan_tensor
-                    log_metrics["teacher_depth_norm_mean"] = nan_tensor
-            if depth_range_tensor is not None:
-                log_metrics["ray_depth_range_mean"] = depth_range_tensor.mean()
-                log_metrics["ray_depth_range_min"] = depth_range_tensor.min()
-                log_metrics["ray_depth_range_max"] = depth_range_tensor.max()
-
-        if feature_breakdown is not None:
-            log_metrics["feature_recon"] = feature_breakdown.recon.detach()
-            log_metrics["feature_cosine"] = feature_breakdown.cosine.detach()
-        if feature_distiller is not None and feature_distiller.enabled:
-            log_metrics["feature_weight_effective"] = torch.tensor(
-                feature_distiller.current_recon_weight, device=device
-            )
-            log_metrics["feature_cos_weight_effective"] = torch.tensor(
-                feature_distiller.current_cosine_weight, device=device
-            )
-            feature_terminal_value = 1.0 if feature_distiller.terminal_reached(global_step) else 0.0
-        else:
-            feature_terminal_value = float("nan")
-        log_metrics["feature_schedule_terminal"] = torch.tensor(feature_terminal_value, device=device)
-        opacity_terminal_value = 1.0 if opacity_scheduler.terminal_reached(global_step) else 0.0
-        log_metrics["opacity_schedule_terminal"] = torch.tensor(opacity_terminal_value, device=device)
-        feature_effective_val = 0.0
-        if "feature_weight_effective" in log_metrics:
-            feature_effective_tensor = log_metrics["feature_weight_effective"]
-            try:
-                feature_effective_val = float(feature_effective_tensor.detach().cpu().item())
-            except (AttributeError, ValueError):
-                feature_effective_val = 0.0
-        feature_cos_effective_val = 0.0
-        if "feature_cos_weight_effective" in log_metrics:
-            feature_cos_tensor = log_metrics["feature_cos_weight_effective"]
-            try:
-                feature_cos_effective_val = float(feature_cos_tensor.detach().cpu().item())
-            except (AttributeError, ValueError):
-                feature_cos_effective_val = 0.0
-        if feature_effective_val > 0.0 or feature_cos_effective_val > 0.0:
-            feature_on_steps += 1
-        if opacity_target_weight_effective > 0.0:
-            opacity_on_steps += 1
-        log_metrics["feature_on_steps"] = torch.tensor(float(feature_on_steps), device=device)
-        log_metrics["opacity_on_steps"] = torch.tensor(float(opacity_on_steps), device=device)
-        if log_feature_mask_fraction is not None:
-            log_metrics["feature_mask_fraction"] = log_feature_mask_fraction.to(device)
-        log_metrics["phase_index"] = torch.tensor(float(current_phase_index), device=device)
-        log_metrics["phase_feature_scale"] = torch.tensor(float(phase_feature_loss_scale), device=device)
-        override_value = (phase_mask_override or "inherit").lower()
-        override_code = mask_override_codes.get(override_value, -1.0)
-        log_metrics["phase_mask_override"] = torch.tensor(float(override_code), device=device)
-        log_metrics.setdefault("mask_emergency_active", torch.tensor(0.0, device=device))
-        log_metrics.setdefault("mask_emergency_count", torch.tensor(0.0, device=device))
-        log_metrics.setdefault("mask_low_fraction_streak", torch.tensor(0.0, device=device))
-
-        if feature_pipeline_active:
-            fraction_targets = {
-                6500: 0.15,
-                7500: 0.20,
-                8500: 0.25,
-            }
-            required_fraction = fraction_targets.get(global_step)
-            if required_fraction is not None:
-                if feature_mask_fraction_value is None:
-                    raise RuntimeError(
-                        f"feature_mask_fraction unavailable at step {global_step}; cannot validate mask coverage"
+                    log_metrics["mask_prefail_active"] = torch.tensor(0.0, device=device)
+                    log_metrics["mask_prefail_count"] = torch.tensor(0.0, device=device)
+                    log_metrics["mask_prefail_drop_rate"] = nan_default
+                    log_metrics["mask_prefail_min_rate"] = nan_default
+                    log_metrics["mask_prefail_threshold"] = nan_default
+                    log_metrics["mask_prefail_variance"] = nan_default
+                if mask_controller is not None:
+                    threshold_value = mask_threshold_for_log
+                    if threshold_value is None:
+                        threshold_value = mask_controller.current_threshold(global_step)
+                    if threshold_value is not None:
+                        log_metrics["feature_mask_threshold"] = torch.tensor(threshold_value, device=device)
+                    else:
+                        log_metrics["feature_mask_threshold"] = nan_default
+                    log_metrics["feature_mask_soft_transition"] = torch.tensor(
+                        mask_controller.current_soft_transition(),
+                        device=device,
                     )
-                if feature_mask_fraction_value < required_fraction:
-                    raise RuntimeError(
-                        f"feature mask fraction {feature_mask_fraction_value:.4f} below required {required_fraction:.2f} at step {global_step}"
-                    )
-                expected_src_dim = int(feature_cfg.projector_input_dim)
-                if feature_src_dim_value is not None and feature_src_dim_value != expected_src_dim:
-                    raise RuntimeError(
-                        f"feature_src_dim reported {feature_src_dim_value} but expected {expected_src_dim} at step {global_step}"
-                    )
-                expected_teacher_dim = feature_cfg.resolved_teacher_dim
-                if expected_teacher_dim is None:
-                    expected_teacher_dim = projector_out_dim_value
-                if expected_teacher_dim is not None and projector_out_dim_value is not None:
-                    if projector_out_dim_value != int(expected_teacher_dim):
-                        raise RuntimeError(
-                            f"projector_out_dim reported {projector_out_dim_value} but expected {int(expected_teacher_dim)} at step {global_step}"
-                        )
-                if feature_distiller is not None and global_step > loss_cfg.feature_warmup_steps:
-                    if feature_distiller.current_recon_weight <= 0.0:
-                        raise RuntimeError(
-                            f"feature reconstruction weight inactive at step {global_step} despite warmup completion"
-                        )
+            if (
+                teacher_depth is not None
+                and loss_cfg.depth_weight > 0.0
+            ):
+                if depth_valid_fraction is None:
+                    depth_valid_fraction = torch.tensor(float("nan"), device=device)
+                log_metrics["depth_valid_fraction"] = depth_valid_fraction
+                log_metrics.update(depth_stat_tensors)
+                if teacher_depth_for_loss is not None:
                     if (
-                        (loss_cfg.feature_target_cosine_weight or 0.0) > 0.0
-                        and feature_distiller.current_cosine_weight <= 0.0
+                        combined_valid_tensor is not None
+                        and combined_valid_tensor.any()
                     ):
+                        norm_values = teacher_depth_for_loss[combined_valid_tensor]
+                        log_metrics["teacher_depth_norm_min"] = norm_values.min()
+                        log_metrics["teacher_depth_norm_max"] = norm_values.max()
+                        log_metrics["teacher_depth_norm_mean"] = norm_values.mean()
+                    else:
+                        nan_tensor = torch.tensor(float("nan"), device=device)
+                        log_metrics["teacher_depth_norm_min"] = nan_tensor
+                        log_metrics["teacher_depth_norm_max"] = nan_tensor
+                        log_metrics["teacher_depth_norm_mean"] = nan_tensor
+                if depth_range_tensor is not None:
+                    log_metrics["ray_depth_range_mean"] = depth_range_tensor.mean()
+                    log_metrics["ray_depth_range_min"] = depth_range_tensor.min()
+                    log_metrics["ray_depth_range_max"] = depth_range_tensor.max()
+    
+            if feature_breakdown is not None:
+                log_metrics["feature_recon"] = feature_breakdown.recon.detach()
+                log_metrics["feature_cosine"] = feature_breakdown.cosine.detach()
+            if feature_distiller is not None and feature_distiller.enabled:
+                log_metrics["feature_weight_effective"] = torch.tensor(
+                    feature_distiller.current_recon_weight, device=device
+                )
+                log_metrics["feature_cos_weight_effective"] = torch.tensor(
+                    feature_distiller.current_cosine_weight, device=device
+                )
+                feature_terminal_value = 1.0 if feature_distiller.terminal_reached(global_step) else 0.0
+            else:
+                feature_terminal_value = float("nan")
+            log_metrics["feature_schedule_terminal"] = torch.tensor(feature_terminal_value, device=device)
+            opacity_terminal_value = 1.0 if opacity_scheduler.terminal_reached(global_step) else 0.0
+            log_metrics["opacity_schedule_terminal"] = torch.tensor(opacity_terminal_value, device=device)
+            feature_effective_val = 0.0
+            if "feature_weight_effective" in log_metrics:
+                feature_effective_tensor = log_metrics["feature_weight_effective"]
+                try:
+                    feature_effective_val = float(feature_effective_tensor.detach().cpu().item())
+                except (AttributeError, ValueError):
+                    feature_effective_val = 0.0
+            feature_cos_effective_val = 0.0
+            if "feature_cos_weight_effective" in log_metrics:
+                feature_cos_tensor = log_metrics["feature_cos_weight_effective"]
+                try:
+                    feature_cos_effective_val = float(feature_cos_tensor.detach().cpu().item())
+                except (AttributeError, ValueError):
+                    feature_cos_effective_val = 0.0
+            if feature_effective_val > 0.0 or feature_cos_effective_val > 0.0:
+                feature_on_steps += 1
+            if opacity_target_weight_effective > 0.0:
+                opacity_on_steps += 1
+            log_metrics["feature_on_steps"] = torch.tensor(float(feature_on_steps), device=device)
+            log_metrics["opacity_on_steps"] = torch.tensor(float(opacity_on_steps), device=device)
+            if log_feature_mask_fraction is not None:
+                log_metrics["feature_mask_fraction"] = log_feature_mask_fraction.to(device)
+            log_metrics["phase_index"] = torch.tensor(float(current_phase_index), device=device)
+            log_metrics["phase_feature_scale"] = torch.tensor(float(phase_feature_loss_scale), device=device)
+            override_value = (phase_mask_override or "inherit").lower()
+            override_code = mask_override_codes.get(override_value, -1.0)
+            log_metrics["phase_mask_override"] = torch.tensor(float(override_code), device=device)
+            log_metrics.setdefault("mask_emergency_active", torch.tensor(0.0, device=device))
+            log_metrics.setdefault("mask_emergency_count", torch.tensor(0.0, device=device))
+            log_metrics.setdefault("mask_low_fraction_streak", torch.tensor(0.0, device=device))
+    
+            if feature_pipeline_active:
+                fraction_targets = {
+                    6500: 0.15,
+                    7500: 0.20,
+                    8500: 0.25,
+                }
+                required_fraction = fraction_targets.get(global_step)
+                if required_fraction is not None:
+                    if feature_mask_fraction_value is None:
                         raise RuntimeError(
-                            f"feature cosine weight inactive at step {global_step} despite warmup completion"
+                            f"feature_mask_fraction unavailable at step {global_step}; cannot validate mask coverage"
                         )
-
+                    if feature_mask_fraction_value < required_fraction:
+                        raise RuntimeError(
+                            f"feature mask fraction {feature_mask_fraction_value:.4f} below required {required_fraction:.2f} at step {global_step}"
+                        )
+                    expected_src_dim = int(feature_cfg.projector_input_dim)
+                    if feature_src_dim_value is not None and feature_src_dim_value != expected_src_dim:
+                        raise RuntimeError(
+                            f"feature_src_dim reported {feature_src_dim_value} but expected {expected_src_dim} at step {global_step}"
+                        )
+                    expected_teacher_dim = feature_cfg.resolved_teacher_dim
+                    if expected_teacher_dim is None:
+                        expected_teacher_dim = projector_out_dim_value
+                    if expected_teacher_dim is not None and projector_out_dim_value is not None:
+                        if projector_out_dim_value != int(expected_teacher_dim):
+                            raise RuntimeError(
+                                f"projector_out_dim reported {projector_out_dim_value} but expected {int(expected_teacher_dim)} at step {global_step}"
+                            )
+                    if feature_distiller is not None and global_step > loss_cfg.feature_warmup_steps:
+                        if feature_distiller.current_recon_weight <= 0.0:
+                            raise RuntimeError(
+                                f"feature reconstruction weight inactive at step {global_step} despite warmup completion"
+                            )
+                        if (
+                            (loss_cfg.feature_target_cosine_weight or 0.0) > 0.0
+                            and feature_distiller.current_cosine_weight <= 0.0
+                        ):
+                            raise RuntimeError(
+                                f"feature cosine weight inactive at step {global_step} despite warmup completion"
+                            )
+    
+            # Update per-step metrics even if feature pipeline is inactive.
+            debug_log("before_moving_avg step=%s" % (global_step,))
             update_moving_averages(log_metrics)
-
+            debug_log("after_moving_avg step=%s" % (global_step,))
+    
             total_loss_detached = total_loss.detach()
             loss_is_finite = bool(torch.isfinite(total_loss_detached).item())
             total_val = float(total_loss_detached.cpu().item()) if loss_is_finite else float("nan")
-
+    
+            debug_log(
+                "log_before_csv step=%s finite=%s total=%s" % (
+                    global_step,
+                    loss_is_finite,
+                    total_val,
+                )
+            )
+    
+            base_log_metrics: Dict[str, torch.Tensor] = dict(loss_dict)
+            base_log_metrics["metrics_schema_version"] = torch.tensor(float(METRICS_SCHEMA_VERSION), device=device)
+            base_log_metrics["learning_rate"] = torch.tensor(current_lr, device=device)
+            base_log_metrics["phase_index"] = torch.tensor(float(current_phase_index), device=device)
+            base_log_metrics["phase_feature_scale"] = torch.tensor(float(phase_feature_loss_scale), device=device)
+            base_log_metrics["opacity_target_weight_effective"] = torch.tensor(opacity_target_weight_effective, device=device)
+            base_log_metrics["opacity_target_weight_base"] = torch.tensor(opacity_target_weight_base, device=device)
+            base_log_metrics["opacity_target_adjustment"] = torch.tensor(opacity_target_adjustment, device=device)
+            base_log_metrics["opacity_lambda_runtime"] = torch.tensor(opacity_lambda_runtime, device=device)
+    
+            metrics_floats_for_log = write_metrics_csv(global_step, total_val, base_log_metrics)
+            debug_log(
+                "log_after_csv step=%s keys=%s" % (
+                    global_step,
+                    len(metrics_floats_for_log),
+                )
+            )
+            if global_step not in logged_steps_tb:
+                debug_log("tb_base_emit step=%s" % (global_step,))
+                emit_tensorboard_scalars(
+                    global_step,
+                    total_val,
+                    metrics_floats_for_log,
+                    full=False,
+                    base=True,
+                )
+                logged_steps_tb.add(global_step)
+                debug_log("tb_base_emit_done step=%s" % (global_step,))
+            debug_log(
+                "log_state step=%s scalar_interval=%s start=%s" % (
+                    global_step,
+                    scalar_log_interval,
+                    start_step,
+                )
+            )
+            steps_since_start = max(global_step - start_step, 0)
+            should_log_interval = (steps_since_start % scalar_log_interval) == 0
+            warmup_span = max(1, min(scalar_log_interval, 5))
+            within_log_warmup = steps_since_start <= warmup_span
+            should_log_step = (
+                should_log_interval
+                or global_step in promotion_pending
+                or not loss_is_finite
+                or global_step == train_cfg.max_steps
+                or within_log_warmup
+            )
+            if scalar_log_interval <= 1:
+                should_log_interval = True
+                should_log_step = True
+            debug_window_limit = start_step + max(200, scalar_log_interval * 4)
+            if global_step <= debug_window_limit:
+                debug_log(
+                    "log_gate step=%s since_start=%s interval_hit=%s warmup=%s should=%s promotion_hit=%s loss_finite=%s" % (
+                        global_step,
+                        steps_since_start,
+                        should_log_interval,
+                        within_log_warmup,
+                        should_log_step,
+                        global_step in promotion_pending,
+                        loss_is_finite,
+                    )
+                )
+            if global_step <= start_step + 5:
+                debug_log(
+                    "log_debug step=%s since_start=%s interval=%s" % (
+                        global_step,
+                        steps_since_start,
+                        scalar_log_interval,
+                    )
+                )
+            emit_metrics = should_log_step or scalar_log_interval <= 1
+            if global_step <= start_step + 5:
+                debug_log(
+                    "log_flags step=%s since_start=%s interval=%s interval_hit=%s warmup=%s should=%s emit=%s" % (
+                        global_step,
+                        steps_since_start,
+                        scalar_log_interval,
+                        should_log_interval,
+                        within_log_warmup,
+                        should_log_step,
+                        emit_metrics,
+                    )
+                )
+            if emit_metrics:
+                if global_step <= debug_window_limit:
+                    debug_log(
+                        "log_emit step=%s" % (
+                            global_step,
+                        )
+                    )
+                postfix = {
+                    "total": f"{total_val:.4f}",
+                    "color": f"{loss_dict['color'].item():.4f}",
+                    "opacity": f"{loss_dict['opacity'].item():.4f}",
+                }
+                if "depth" in loss_dict:
+                    postfix["depth"] = f"{loss_dict['depth'].item():.4f}"
+                if "feature" in loss_dict:
+                    postfix["feature"] = f"{loss_dict['feature'].item():.4f}"
+                for extra_key in ("depth_valid_fraction", "teacher_depth_min", "teacher_depth_max", "teacher_depth_mean"):
+                    if extra_key in log_metrics:
+                        postfix[extra_key] = f"{log_metrics[extra_key].item():.4f}"
+                for feat_key in ("feature_recon", "feature_cosine"):
+                    if feat_key in log_metrics:
+                        postfix[feat_key] = f"{log_metrics[feat_key].item():.4f}"
+    
+                elapsed_sec = time.perf_counter() - train_start_time
+                steps_done = max(global_step - start_step, 0)
+                remaining_steps = 0
+                if train_cfg.max_steps > 0:
+                    remaining_steps = max(train_cfg.max_steps - global_step, 0)
+                if steps_done > 0 and elapsed_sec > 0.0:
+                    if step_time_ema is not None and remaining_steps > 0:
+                        eta_seconds = step_time_ema * remaining_steps
+                        postfix["eta"] = str(timedelta(seconds=int(eta_seconds)))
+                        postfix["step_time"] = f"{step_time_ema:.2f}s"
+                    elif remaining_steps > 0:
+                        avg_step = elapsed_sec / steps_done
+                        eta_seconds = avg_step * remaining_steps
+                        postfix["eta"] = str(timedelta(seconds=int(eta_seconds)))
+                        postfix["step_time"] = f"{avg_step:.2f}s"
+                    else:
+                        if step_time_ema is not None:
+                            postfix["step_time"] = f"{step_time_ema:.2f}s"
+                    postfix["elapsed"] = str(timedelta(seconds=int(elapsed_sec)))
+                progress.set_postfix(**postfix)
+                try:
+                    progress.refresh()
+                except Exception:
+                    pass
             if health_enabled and not health_monitor_finished and global_step <= health_record_limit:
                 def _snapshot_value(key: str, fallback: Optional[float] = None) -> float:
                     value = log_metrics.get(key)
@@ -5560,7 +5890,7 @@ def train(
                         return float(value)
                     except (TypeError, ValueError):
                         return float("nan")
-
+    
                 snapshot = {
                     "feature_mask_fraction": _snapshot_value(
                         "feature_mask_fraction",
@@ -5605,120 +5935,72 @@ def train(
                     health_monitor_finished = True
                     if not ok_fail and health_failfast:
                         raise TrainingAbort("Health check snapshot deemed abnormal.", exit_code=12)
-
-            steps_since_start = max(global_step - start_step, 0)
-            should_log_interval = (steps_since_start % scalar_log_interval) == 0
-            should_log_step = (
-                should_log_interval
-                or global_step in promotion_pending
-                or not loss_is_finite
-                or global_step == train_cfg.max_steps
-            )
-            debug_window_limit = start_step + max(200, scalar_log_interval * 4)
-            if global_step <= debug_window_limit:
-                debug_log(
-                    "log_gate step=%s since_start=%s interval_hit=%s should=%s promotion_hit=%s loss_finite=%s" % (
-                        global_step,
-                        steps_since_start,
-                        should_log_interval,
-                        should_log_step,
-                        global_step in promotion_pending,
-                        loss_is_finite,
-                    )
-                )
-
-            if should_log_step:
-                if global_step <= debug_window_limit:
-                    debug_log(
-                        "log_emit step=%s" % (
-                            global_step,
-                        )
-                    )
-                postfix = {
-                    "total": f"{total_val:.4f}",
-                    "color": f"{loss_dict['color'].item():.4f}",
-                    "opacity": f"{loss_dict['opacity'].item():.4f}",
-                }
-                if "depth" in loss_dict:
-                    postfix["depth"] = f"{loss_dict['depth'].item():.4f}"
-                if "feature" in loss_dict:
-                    postfix["feature"] = f"{loss_dict['feature'].item():.4f}"
-                for extra_key in ("depth_valid_fraction", "teacher_depth_min", "teacher_depth_max", "teacher_depth_mean"):
-                    if extra_key in log_metrics:
-                        postfix[extra_key] = f"{log_metrics[extra_key].item():.4f}"
-                for feat_key in ("feature_recon", "feature_cosine"):
-                    if feat_key in log_metrics:
-                        postfix[feat_key] = f"{log_metrics[feat_key].item():.4f}"
-
-                elapsed_sec = time.perf_counter() - train_start_time
-                steps_done = max(global_step - start_step, 0)
-                remaining_steps = 0
-                if train_cfg.max_steps > 0:
-                    remaining_steps = max(train_cfg.max_steps - global_step, 0)
-                if steps_done > 0 and elapsed_sec > 0.0:
-                    if step_time_ema is not None and remaining_steps > 0:
-                        eta_seconds = step_time_ema * remaining_steps
-                        postfix["eta"] = str(timedelta(seconds=int(eta_seconds)))
-                        postfix["step_time"] = f"{step_time_ema:.2f}s"
-                    elif remaining_steps > 0:
-                        avg_step = elapsed_sec / steps_done
-                        eta_seconds = avg_step * remaining_steps
-                        postfix["eta"] = str(timedelta(seconds=int(eta_seconds)))
-                        postfix["step_time"] = f"{avg_step:.2f}s"
-                    else:
-                        if step_time_ema is not None:
-                            postfix["step_time"] = f"{step_time_ema:.2f}s"
-                    postfix["elapsed"] = str(timedelta(seconds=int(elapsed_sec)))
-                progress.set_postfix(**postfix)
+    
+            if (
+                should_log_step
+                and quicklook_interval > 0
+                and generate_quicklook is not None
+                and global_step > 0
+                and global_step % quicklook_interval == 0
+            ):
                 try:
-                    progress.refresh()
-                except Exception:
-                    pass
-                append_metrics(global_step, total_val, log_metrics)
-
-                if (
-                    quicklook_interval > 0
-                    and generate_quicklook is not None
-                    and global_step > 0
-                    and global_step % quicklook_interval == 0
-                ):
+                    quicklook_dir = logging_cfg.csv.parent
+                    quicklook_dir.mkdir(parents=True, exist_ok=True)
+                    step_image = quicklook_dir / f"quicklook_step_{global_step:06d}.png"
+                    recent_window = max(quicklook_interval * 6, 600)
+                    rolling_window = max(min(quicklook_interval // 4, 128), 16)
+                    generate_quicklook(
+                        metrics_csv=logging_cfg.csv,
+                        output_path=step_image,
+                        recent_steps=recent_window,
+                        rolling=rolling_window,
+                    )
+                    latest_image = quicklook_dir / "quicklook_latest.png"
                     try:
-                        quicklook_dir = logging_cfg.csv.parent
-                        quicklook_dir.mkdir(parents=True, exist_ok=True)
-                        step_image = quicklook_dir / f"quicklook_step_{global_step:06d}.png"
-                        recent_window = max(quicklook_interval * 6, 600)
-                        rolling_window = max(min(quicklook_interval // 4, 128), 16)
-                        generate_quicklook(
-                            metrics_csv=logging_cfg.csv,
-                            output_path=step_image,
-                            recent_steps=recent_window,
-                            rolling=rolling_window,
-                        )
-                        latest_image = quicklook_dir / "quicklook_latest.png"
-                        try:
-                            shutil.copyfile(step_image, latest_image)
-                        except Exception:  # pragma: no cover - best effort copy
-                            pass
-                    except QuicklookGenerationError as err:
-                        if not quicklook_error_logged:
-                            progress.write(f"[quicklook] generation skipped: {err}")
-                            quicklook_error_logged = True
-                    except Exception as err:  # pragma: no cover - matplotlib missing or similar
-                        if not quicklook_error_logged:
-                            progress.write(f"[quicklook] unexpected failure: {err}")
-                            quicklook_error_logged = True
-
+                        shutil.copyfile(step_image, latest_image)
+                    except Exception:  # pragma: no cover - best effort copy
+                        pass
+                except QuicklookGenerationError as err:
+                    if not quicklook_error_logged:
+                        progress.write(f"[quicklook] generation skipped: {err}")
+                        quicklook_error_logged = True
+                except Exception as err:  # pragma: no cover - matplotlib missing or similar
+                    if not quicklook_error_logged:
+                        progress.write(f"[quicklook] unexpected failure: {err}")
+                        quicklook_error_logged = True
+    
             enforce_promotion_gate(global_step, log_metrics)
-
+    
             if not loss_is_finite:
                 snapshot_recent_metrics()
                 raise TrainingAbort(f"Non-finite loss detected at step {global_step}", exit_code=86)
-
+    
             optimizer.zero_grad()
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(trainable_parameters, train_cfg.gradient_clip_norm)
             optimizer.step()
-
+    
+            steps_since_start_post = max(global_step - start_step, 0)
+            should_log_interval_post = (steps_since_start_post % scalar_log_interval) == 0
+            warmup_span_post = max(1, min(scalar_log_interval, 5))
+            within_log_warmup_post = steps_since_start_post <= warmup_span_post
+            emit_tensorboard = (
+                scalar_log_interval <= 1
+                or should_log_interval_post
+                or within_log_warmup_post
+                or global_step in promotion_pending
+                or not loss_is_finite
+                or global_step == train_cfg.max_steps
+            )
+            emit_tensorboard_scalars(
+                global_step,
+                total_val,
+                metrics_floats_for_log,
+                full=emit_tensorboard,
+                base=False,
+            )
+            logged_steps_tb.add(global_step)
+    
             step_end_time = time.perf_counter()
             step_duration = step_end_time - step_start_time
             if step_duration > 0.0:
@@ -5726,11 +6008,11 @@ def train(
                     step_time_ema = step_duration
                 else:
                     step_time_ema = step_time_ema_alpha * step_duration + (1.0 - step_time_ema_alpha) * step_time_ema
-
+    
             if global_step % train_cfg.checkpoint_interval == 0:
                 ckpt_path = save_checkpoint(global_step)
                 progress.write(f"Saved checkpoint to {ckpt_path}")
-
+    
     except TrainingAbort as err:
         abort_exc = err
 
