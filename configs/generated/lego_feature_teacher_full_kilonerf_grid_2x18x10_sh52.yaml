@@ -95,11 +95,18 @@ feature_targets:
 feature_pipeline:
   enabled: true
   teacher_mode: gaussian_sh_opacity_logscale
-  compare_space: teacher
+  compare_space: student
   projector:
     in_dim: 128
-    out_dim: 52
-  teacher_adapter: null
+    hidden_dim: 256
+    out_dim: 128
+  teacher_adapter:
+    type: linear
+    in_dim: 52
+    out_dim: 128
+    activation: identity
+    use_layer_norm: false
+    dropout: 0.0
   student_adapter: null
   allow_dim_mismatch: false
   boundary_mask_threshold: 0.60
