@@ -311,6 +311,21 @@ tensorboard --logdir tmp/tb_scalar_debug/logs/tensorboard --host 127.0.0.1 --por
 - `alpha_penalty_weight` は 0.166 で頭打ち、`alpha_guard_penalty` も 0.058〜0.060 台で横ばい。
 - 終盤で `loss/depth`（0.0378 → 0.0388）と `loss/opacity`（0.0301 → 0.0317）がじわ上昇。Alpha Guard が押し戻さない点は良好だが、深度・不透明度のペナルティが総損失を支え始めた。
 
+**10k v5 実行結果（2025-10-22）**
+
+- `loss/depth` の反発が 0.0299 → 0.0306 に抑制され、depth 緩和の効果を確認。
+- `loss/opacity` は 0.0301 → 0.0316 と微増し、α 圧がなお強いことが判明。
+- `loss/color` は 0.085 付近で高止まり。
+- `loss/total` は 4k で最小 0.223 → 終盤 0.232 で軽い右肩上がりが残る。
+
+**10k v6 実行結果（2025-10-22）**
+
+- `loss/total` が 0.219 → 0.220（終盤）でほぼ横ばいに維持。
+- `loss/opacity` は 0.0293 → 0.0320 に微増するが、v5 より圧は弱まった。
+- `loss/color` は 0.087 付近で安定。
+- `alpha_penalty_weight` は 0.121 → 0.141、`opacity_target_weight_effective` は 0.05 → 0.129 に到達し、狙い通り 0.13 付近で頭打ち。
+- `alpha_guard_penalty` は 0.056 → 0.053 と微減し、α ガードは安定稼働。
+
 **フィードバック統合（2025-10-22）**
 
 - **P0: 評価と損失の落とし穴**
@@ -341,7 +356,7 @@ tensorboard --logdir tmp/tb_scalar_debug/logs/tensorboard --host 127.0.0.1 --por
 
 1. **P0 の検証を最優先**: linear 化・アルファ合成・カメラ一致・前景 PSNR を含む評価パイプラインを再点検し、1 視点オーバーフィットと EMA 評価のサニティを取る。
 2. **P1 の即効調整**: depth 重みを 0.06〜0.08 に下げる／`alpha_threshold` を 0.7 へ上げる案を `configs/generated/lego_feature_student_rgb_fourier_skip_10k_v5.yaml` で確認し、結果に応じて `configs/generated/lego_feature_student_rgb_fourier_skip_10k_v6.yaml` で opacity target / relax_rate を微調整。並行して勾配ノルム比と透過率ヒストグラムをログ化する。
-3. **P1 モデル強化ロードマップ**: v6 の評価が終わり次第、view-dependent 色ヘッド導入（方向エンコ／二段ヘッド）と projector 学習率の段階管理、feature 損失正規化を短期ランで仕上げ、効いた構成を 20k→100k へ展開。
+3. **P1 モデル強化ロードマップ**: v6 の評価を経て view-dependent 色ヘッド導入（方向エンコ／二段ヘッド）と projector 学習率の段階管理、feature 損失正規化を短期ランで仕上げ、効いた構成を 20k→100k へ展開。
 4. **P2 の運用底上げ**: グリッド段階化・重要度サンプリング・評価二本立て・CKA/SWA など中期施策を順次投入し、22 dB 台に乗る長期スケジュールを整備する。
 
 ### 運用ルール（2025-10-22 更新）
