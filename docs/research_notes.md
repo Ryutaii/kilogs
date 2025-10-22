@@ -213,7 +213,147 @@ tensorboard --logdir tmp/tb_scalar_debug/logs/tensorboard --host 127.0.0.1 --por
 
 ---
 
+## 2025-10-21 — 現状整理と今後の方針（student-space, KiloNeRF模倣）
+
+**現状メモ**
+
+- `student.type = kilo_uniform_mlp` はローカル座標のみを入力するシンプルな sub-MLP のままで、先行研究 KiloNeRF の Fourier 符号化や view 方向分岐をまだ取り込めていない。
+- 50k 本走の途中（step ≈ 4.5k）で `loss/total` が上昇傾向のまま。feature loss warmup が 4k step で立ち上がること、グリッド解像度を引き上げた影響で収束が後半へずれ込んでいる可能性を考慮する。
+- TensorBoard / CSV ログ基盤は復旧済みで、`loss/color`, `loss/feature_*`, `train/learning_rate` など細分化された指標を追える状態。
+
+**方針（短期〜中期）**
+
+- 50k ランを主軸にしつつ、以下の判定ポイントで挙動をチェックし、異常なら早期に設定を見直す。
+  - step 2k：projector warmup 中。feature loss が 0 付近に留まっているか、color loss が緩やかに下降しているか。
+  - step 4k〜6k：feature warmup 完了直後。`loss/feature_l2`／`loss/feature_cos` の暴れ具合と `loss/total` の折れ曲がりを確認。
+  - step 10k：下降傾向が見えない場合はいったん停止し、短期用コンフィグでハイパラ／構造を調整してから再開。
+- ハイパラ探索専用に 10k 上限の軽量コンフィグを作成し、cosine スケジュールや feature warmup を 10k 想定に縮めた “スモークテスト仕様” を別 YAML として運用する。
+- 上記 10k コンフィグでは、KiloNeRF 本家の sub-MLP 構造（Fourier 符号化 + `refeed_position_index` + 方向分岐）を段階的に移植し、構造改善が損失低下に効くかを切り分ける。
+- 10k で得たハイパラを 50k へそのまま移植せず、**LR スケジュールと warmup を 50k 用に再スケール**した上で再検証する。必要に応じて 25k など中間長のランを挟む。
+
+**研究運用メモ（一般的なワークフロー）**
+
+- 多くの研究者は「短期ラン（5k〜10k）で挙動確認 → 本走（50k〜100k）」の二段構えを採用。短期ラン用コンフィグを別管理し、ログ間隔や warmup を短縮して素早く問題を洗い出す。
+- TensorBoard と CSV の双方を見て `loss/total` の下降兆候が消えた時点で早めに止め、設定を見直す。惰性で 50k まで走らせないのがコスト効率が高い。
+- 解像度を高めた学生は初期に学習が進みにくく、Fourier 符号化や skip が無いと高周波を拾えず後半でしか収束しない例がある。構造改善前は “10kで即中止” ルールを緩め、50k 序盤での改善有無を見てから判断する柔軟性も必要。
+- 10k 調整で得たパラメータは **挙動確認の指標** と割り切り、本走では再スケール・再調整を必ず行う。二度手間ではなく、長距離ランの失敗リスクを抑えるための投資と捉える。
+
+**TODO (2025-10-21 時点)**
+
+1. `_KiloNeRFStudent` へ Fourier 符号化と方向入力を導入する設計案をまとめ、レイ方向ベクトルを学習ループに渡すための変更点を洗い出す。
+2. `configs/generated/lego_feature_teacher_full_student_space_gaussian_full.yaml` をベースに 10k 用テンプレ (`*_10k_debug.yaml`) を作成し、cosine スケジュール／warmup／phase を 10k 想定に再設定する。
+3. 50k 本走を継続しつつ、判定ポイント（2k/4k/10k）で TensorBoard を確認。下降が見られない場合は一旦停止し、10k テンプレでハイパラ・構造改善を試す。
+4. 10k テンプレで改善が確認できたら、スケジュールを 50k 用に引き延ばして再度フルランを実施し、性能の持続性を評価する。
+
+---
+
+## 2025-10-21 — KiloNeRF sub-MLP 構造の統合計画
+
+**実装タスクリスト**
+
+1. **Fourier 位置符号化＋skip**: `_KiloNeRFStudent` に `L≈10` の sin/cos 展開を追加し、`refeed_position_index` を通じて位置特徴を中層へ再注入。入力チャネルと層構成を KiloNeRF 本家の小型版に合わせる。
+2. **方向分岐（view-dependent）**: レイ方向を spherical/Fourier で符号化し、late feed で color ブランチに結合。view-independent 成分と統合して RGB を予測。
+3. **密度ヘッド初期化改善**: `sigma_activation=shifted_softplus`、`sigma_bias≈1.5` を導入し、初期の霧状態を抑える。
+4. **データパス拡張**: `sample_along_rays` から student forward まで方向ベクトルを渡せるようテンソル構造を更新。batch 形状と GPU 実装の整合を確認する。
+5. **10k 段階検証**: Fourier → 方向分岐 → feature 蒸留再開の順で 10k 用コンフィグ（Experiment #2/#3）を走らせ、効果が出た構成を 50k スケールへ移植。
+
+**補足メモ**
+
+- ログ基盤が安定したため、各ステップで TensorBoard/CSV を比較可能。忘備録として本項に記載。
+- 実装対象は `distill/lego_response_distill.py` の `_KiloNeRFStudent` とレイサンプル処理が中心。feature pipeline を再度有効化する際は、今回入れた promotion gate ガードがそのまま効く。
+
+---
+
 ## 2025-10-21 — 10k スモークラン再開テンプレ
+
+## 2025-10-22 — 100k ラン中断と短期ハイパラ調整方針
+
+**状況整理**
+
+- Fourier+skip 構成で 100k ランを実行したところ、step ≈60k 時点で `loss/total ≈ 0.55` まで右肩上がり。`loss/color` は減少傾向だが `loss/opacity` と `loss/depth` がじわ上昇し、総損失を押し上げている。
+- α ロスが強すぎる／立ち上がりが早すぎると判断し、ランを中断。
+
+**対処方針**
+
+1. まず 10k・20k の短期ランで α/σ 周りの調整を素早く検証する。
+2. α ロスはさらに弱く遅延させる（`weight=0.05`、`warmup_steps` を 8k〜12k、`max_weight=0.15`）。
+3. σ バイアスを `-1.2` に下げて初期密度をさらに薄くし、霧の発生を抑える。
+4. これらを 10k/20k テンプレートで検証し、`loss/total` が横ばい〜微減に転じるか確認してから長期ランを再開する。
+
+**新規テンプレート**
+
+- `configs/generated/lego_feature_student_rgb_fourier_skip_10k_v2.yaml`
+  - α weight 0.05、warmup 8000、max weight 0.15。
+  - `sigma_bias=-1.2` を適用。
+  - 10k ステップ、評価/レンダ間隔 2000。
+- `configs/generated/lego_feature_student_rgb_fourier_skip_20k_v2.yaml`
+  - 同じ α 設定を 20k 用にスケーリング（warmup 12000、schedule 15000）。
+  - 20k ステップ、評価/レンダ間隔 4000。
+- `configs/generated/lego_feature_student_rgb_fourier_skip_10k_v3.yaml`
+  - Alpha Guard を緩めて `weight_cap=0.25`、`penalty_hi=0.30`、`relax_rate=1.01` に調整。
+  - 目的は `opacity_target_weight_effective` を 0.08〜0.10 で維持させつつ `alpha_guard_penalty` の暴騰を抑える。
+- `configs/generated/lego_feature_student_rgb_fourier_skip_10k_v4.yaml`
+  - Opacity スケジュールを短期向けに再設計（`start_weight=0.05`、`warmup=2000`、`target_weight=0.12`）。
+  - 6k 付近で 0.08 超、10k で 0.12 に到達させ、Alpha Guard が `target_weight_effective` を底上げできる状況を作る。
+
+**10k v4 実行結果（2025-10-22）**
+
+- `loss/color` は 0.138 → 0.075 まで減少し、`loss/total` も 0.276 → 0.224 へ改善。
+- `opacity_target_weight_effective` は序盤 0.05 から終盤 0.165 まで滑らかに上昇し、貼り付き問題は解消。
+- `alpha_penalty_weight` は 0.166 で頭打ち、`alpha_guard_penalty` も 0.058〜0.060 台で横ばい。
+- 終盤で `loss/depth`（0.0378 → 0.0388）と `loss/opacity`（0.0301 → 0.0317）がじわ上昇。Alpha Guard が押し戻さない点は良好だが、深度・不透明度のペナルティが総損失を支え始めた。
+
+**次の一手**
+
+1. Depth ペナルティ緩和案を評価する（`loss.depth.weight` を 0.06〜0.08 に下げる、または `alpha_threshold` を 0.7 へ変更）→ 10k v5 を実行し `loss/depth` の反発が抑えられるか確認。
+2. それでも `loss/opacity` の反転が残る場合は、`loss.opacity.target_weight` を 0.11 に下げるか、`alpha_guard.relax_rate` を 1.005 へ緩めて effective weight を ~0.13 に留める調整を検証。
+3. 10k での改善が得られたら同設定を 20k スケールへ展開し、問題なければ 100k テンプレートに拡張して本番ランへ繋ぐ。
+
+### 運用ルール（2025-10-22 更新）
+
+- **実行前**: 対象ランの既存ログと結果を必ず削除する。
+  ```bash
+  rm -rf logs/lego/feat_t_full/runs/<run_name> \
+         results/lego/feat_t_full/runs/<run_name>
+  ```
+- **実行後に提示するコマンド（徹底）**:
+  1. ログ削除コマンド（上記）
+  2. TensorBoard 起動コマンド
+     ```bash
+     tensorboard --logdir logs/lego/feat_t_full/runs/<run_name>/tensorboard \
+                 --host 127.0.0.1 --port 6006
+     ```
+  3. 該当コンフィグの実行コマンド
+     ```bash
+    CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+    PYTHONHASHSEED=2025 KILOGS_LOG_INTERVAL=20 \
+     python -m distill.lego_response_distill --config <config_path>
+     ```
+- どの run/config を使っても上記 3 点を必ずユーザーへ案内する。`<run_name>` と `<config_path>` は実行内容に合わせて置き換える。
+- **cuBLAS ワークスペース**: デバッグ再現性を高めるため、実行コマンド内で `CUBLAS_WORKSPACE_CONFIG=:4096:8` を必ず指定する。シェル全体に適用したい場合は以下を実行してから上記コマンドを叩く。
+  ```bash
+  export CUBLAS_WORKSPACE_CONFIG=:4096:8
+  ```
+  処理が極端に遅い場合のみ解除を検討（コード内でも未設定時は自動で `:4096:8` を適用）。
+
+---
+
+**実施内容**
+
+- `configs/generated/lego_feature_student_rgb_only_10k_debug.yaml` を作成し、feature pipeline を無効化した状態で 10k までの挙動を見るベースラインを準備。
+- `Promotion gates require the feature pipeline to be enabled.` エラーが発生したため、`distill/lego_response_distill.py` を更新し **feature pipeline が無効のときは promotion_gates を自動で無視** するようロジックを整理（警告ログのみ）。
+- 再実行後、TensorBoard / CSV ログが正常に生成されることを確認。ランは `tensorboard --logdir logs/lego/feat_t_full/runs/student_rgb_only_10k_debug/tensorboard` で監視可能。
+
+**得られた学び**
+
+- Promotion gate は feature 蒸留フェーズ前提の設計になっているため、RGB-only ランでは自動無効化が安全。コンフィギュレーション側で `promotion_gates: []` としても読み替え処理で default が復活するため、実装側で guard するのが確実。
+- `Promotion gates require ...` 例外は比較的初期（teacher 読み込み直後）に発生しランが止まる。短期デバッグではログ掃除→再実行の手数が増えるので、feature pipeline オフ時は gate を完全停止する実装を固定化しておくと回転が良い。
+
+**次のアクション**
+
+1. この 10k ランの `training_metrics.csv` / TensorBoard を確認し、`loss/color` が 3k までに下降に転じるかをチェック。未達ならサンプリング／構造改善の検討へ。
+2. Fourier 位置符号化＋skip を導入した Experiment #2 コンフィグを派生させ、同じ 10k テンプレで比較。
+3. 方向分岐・feature 蒸留を追加する実験に向け、今回の promotion guard を踏まえて段階的に `feature_pipeline.enabled` を再度オンにする準備を進める。
 
 **目的**
 
