@@ -92,10 +92,12 @@ tensorboard --logdir logs/tmp/tb_axis_cli/tensorboard --host 127.0.0.1 --port 60
 
 ---
 
+
 ## 2025-10-20 — CUDA error 304（WSL）調査
 
 * 症状: `torch.cuda.is_available()` が False。`kilonerf_cuda.init_magma()` で `RuntimeError: CUDA error: OS call failed or operation not supported on this OS`。`dmesg` には `dxgkio_query_adapter_info: Ioctl failed: -22` が多数。
 * 切り分け:
+
   * `nvidia-smi` は成功（Driver 553.50 / CUDA 12.4 / RTX A4500）。
   * `LD_LIBRARY_PATH=/usr/lib/wsl/lib python -c "import ctypes; cuInit(0)"` でも 304 が返る → WSL の libcuda スタブが `CUDA_ERROR_NOT_SUPPORTED` を返却。
   * `torch` や `kilonerf_cuda` からの呼び出しも同じエラーに帰結。
