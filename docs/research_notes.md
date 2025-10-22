@@ -295,6 +295,9 @@ tensorboard --logdir tmp/tb_scalar_debug/logs/tensorboard --host 127.0.0.1 --por
 - `configs/generated/lego_feature_student_rgb_fourier_skip_10k_v4.yaml`
   - Opacity スケジュールを短期向けに再設計（`start_weight=0.05`、`warmup=2000`、`target_weight=0.12`）。
   - 6k 付近で 0.08 超、10k で 0.12 に到達させ、Alpha Guard が `target_weight_effective` を底上げできる状況を作る。
+- `configs/generated/lego_feature_student_rgb_fourier_skip_10k_v5.yaml`
+  - Depth 正則化を弱めるため `loss.depth.weight=0.08`、`alpha_threshold=0.7` に調整。
+  - 目的は前景領域へ焦点を絞りつつ depth/opacity の終盤反発を抑え、total loss の横ばいを維持すること。
 
 **10k v4 実行結果（2025-10-22）**
 
@@ -332,7 +335,7 @@ tensorboard --logdir tmp/tb_scalar_debug/logs/tensorboard --host 127.0.0.1 --por
 **次の一手**
 
 1. **P0 の検証を最優先**: linear 化・アルファ合成・カメラ一致・前景 PSNR を含む評価パイプラインを再点検し、1 視点オーバーフィットと EMA 評価のサニティを取る。
-2. **P1 の即効調整**: depth 重みを 0.06〜0.08 に下げる／`alpha_threshold` を 0.7 へ上げる案を v5 で検証し、並行して勾配ノルム比と透過率ヒストグラムをログ化。必要なら opacity target / relax_rate を微調整。
+2. **P1 の即効調整**: depth 重みを 0.06〜0.08 に下げる／`alpha_threshold` を 0.7 へ上げる案を `configs/generated/lego_feature_student_rgb_fourier_skip_10k_v5.yaml` で検証し、並行して勾配ノルム比と透過率ヒストグラムをログ化。必要なら opacity target / relax_rate を微調整。
 3. **P1 モデル強化ロードマップ**: view-dependent 色ヘッド導入と projector 学習率の段階管理、feature 損失正規化を短期ランで仕上げ、効いた構成を 20k→100k へ展開。
 4. **P2 の運用底上げ**: グリッド段階化・重要度サンプリング・評価二本立て・CKA/SWA など中期施策を順次投入し、22 dB 台に乗る長期スケジュールを整備する。
 
