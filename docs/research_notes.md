@@ -17,6 +17,62 @@ Stable, reproducible pipeline for rendering & evaluating student vs teacher on *
 
 ---
 
+## 2025-10-22 — Evaluation 一貫性チェックツール整備
+
+* `tools/eval_consistency.py` を新規作成。教師アセット（RGBA/深度/チェックポイント）の存在確認→学生レンダの整合性チェック→必要に応じて再合成＋メトリクス再計算まで一括で実行できるようにした。
+* 使い方テンプレ:
+
+  ```bash
+  python tools/eval_consistency.py \
+    --student-render-root tmp/lego/student_rgb_fourier_dir_depth060_v1 \
+    --student-checkpoint results/lego/feat_t_full/runs/student_rgb_fourier_dir_depth060_v1/checkpoints/step_010000.pth \
+    --teacher-outputs teacher/outputs/lego/test_white/ours_30000 \
+    --expected-frames 200 \
+    --recompute-metrics \
+    --summary-csv metrics_summary.csv \
+    --method-name student_rgb_fourier_dir_depth060_v1
+  ```
+
+  * `.npz` を `render_student.py` で保存していない場合は `--skip-rgba` で rgba 検査をスキップし、PNG のみで構成されているかを確認できる。
+  * `--recompute-metrics` を付ければ背景再合成→`evaluate_student_metrics` 呼び出し→JSON/CSV 更新まで自動化。既存の recomposed ディレクトリをクリアしたいときは `--clean` を併用。
+* チェック項目: 学生レンダのフレーム数・`render_stats.json` の存在・教師/学生の `.png` 対応、教師チェックポイントのサイズなどを明示的に検査するため、評価前のプリフライトとして毎回実行する。
+* LEGO 応答10k本走（`student_rgb_fourier_dir_depth060_v1`）を再現。`training_metrics.csv` から `loss/total` 最小値は step 2334 の 0.178、最終ステップ 10000 では `color=0.0603`, `opacity=0.0226`, `alpha_guard_penalty=0.0671`。直近 100 step 平均は `total=0.253`, `color=0.104`, `opacity=0.0301` でやや悪化傾向。
+* `render_student.py` + `--store-rgba` で `results/lego/feat_t_full/runs/student_rgb_fourier_dir_depth060_v1/eval_white/` に 200 枚レンダリング → `python tools/eval_consistency.py ... --recompute-metrics` で白背景 PSNR/SSIM/LPIPS を算出（PSNR 10.87 / SSIM 0.726 / LPIPS 0.312, avg_fps 0.129）。期待値より著しく低いため、背景再合成が正しく行われているか・RGBA 正規化が崩れていないかを要再確認。
+* 差分調査用に `tools/inspect_frame_diff.py` を追加。`--use-recomposed --background white` で `tmp/frame_diffs/stack_*.png` を出力し、00000/00050/00100 の PSNR が 11〜13 dB 程度・最大差分 1.0 まで振れていることを確認。学生レンダがほぼ白飛びしているため、opacity 制御（ターゲット 0.05→0.11 の上げ幅、alpha guard 重み 0.12→0.14）を緩和するか、dir_L/深度重みスイープで色収束を優先する必要あり。
+* 10k スイープ第2案として `configs/generated/lego_feature_student_rgb_fourier_dir_depth030_alpha075.yaml` を追加。`loss.opacity.weight/target/target_weight` を 0.035/0.035/0.08 に抑え、`alpha_guard.initial_weight=0.08`・`weight_floor=0.03`・`weight_cap=0.18` に再設定。`loss.depth.weight` も 0.03 に下げ、色収束を優先したソフト alpha 版を検証予定。
+* `lego_feature_student_rgb_fourier_dir_depth030_alpha075` ラン完了。`loss/total` 最小 0.145（step 2334）、最終 0.197。`opacity` 最終 0.0166 まで降下し、`alpha_guard_penalty` は 0.0627 で安定。
+* `eval_consistency.py --recompute-metrics` で白背景評価 → PSNR 10.83 / SSIM 0.727 / LPIPS 0.307 / avg_fps 0.127。PSNR はほぼ横ばいで、白飛び軽減は見られるが教師との差は依然大きい。
+* 差分スタックを `tmp/frame_diffs_depth030/` に保存。00000 の MAE 0.147・max_diff 0.996 など、明部でのズレは残存。ただし opacity map がより締まり、背景の透け具合は改善傾向。
+
+---
+
+## 2025-10-23 — 特徴蒸留v11 デバッグランと TensorBoard 指標整理
+
+* `distill/lego_response_distill.py` の TensorBoard 出力を整理。`full=True` で記録するスカラーを `loss/color`, `loss/opacity`, `loss/depth`, `loss/feature_recon`, `loss/feature_cosine`, `opacity/alpha_guard_penalty`, `opacity/target_weight_effective` の計 7 本へ縮小。
+* デバッグ専用コンフィグ `configs/generated/lego_feature_student_rgb_fourier_dir_depth030_alpha075_feature50k_debug10k.yaml` を新設。`experiment.name=feature_distill_v11_debug10k`, `progress_desc=特徴蒸留v11` とし、log/output も `feature_distill_v11_debug10k` 配下へ分離。
+* 実行手順テンプレ:
+
+  ```bash
+  # 1) 旧ログの削除
+  rm -rf logs/lego/feat_t_full/runs/feature_distill_v11_debug10k \
+         results/lego/feat_t_full/runs/feature_distill_v11_debug10k
+
+  # 2) 10k デバッグラン起動
+  PYTHONHASHSEED=2025 \
+  conda run -n kilogs python -m distill.lego_response_distill \
+    --config configs/generated/lego_feature_student_rgb_fourier_dir_depth030_alpha075_feature50k_debug10k.yaml
+
+  # 3) TensorBoard
+  conda run -n kilogs tensorboard \
+    --logdir logs/lego/feat_t_full/runs/feature_distill_v11_debug10k/tensorboard \
+    --host 127.0.0.1 --port 6006
+  ```
+
+* 進捗バーの表示名が `(特徴蒸留v11)` となり、メトリクス確認が簡潔化。次回 v12 へ更新する際は `experiment.name`, `output_dir`, `progress_desc` の末尾を揃えてバージョンを increment する。
+* `logs/.../training_metrics.csv` の初期行から希望のスカラーが並ぶことを確認済み（Step 1〜20）。TensorBoard 側も絞ったスカラーだけが表示され、ノイズが減少。
+
+---
+
 ## 2025-10-18 — TensorBoard logging cadence
 
 * Updated `configs/lego_feature_teacher_full_student_space_kilonerf_grid.yaml` so `logging.log_interval = 50`. TensorBoard scalar plots now log every 50 steps, giving ~1,000 points over a 50K iteration run without ballooning CSV size. Horizontal axis remains the global training `step`, so TensorBoard renders the curve as an Iter-vs-metric line plot.
@@ -358,6 +414,249 @@ tensorboard --logdir tmp/tb_scalar_debug/logs/tensorboard --host 127.0.0.1 --por
 2. **P1 の即効調整**: depth 重みを 0.06〜0.08 に下げる／`alpha_threshold` を 0.7 へ上げる案を `configs/generated/lego_feature_student_rgb_fourier_skip_10k_v5.yaml` で確認し、結果に応じて `configs/generated/lego_feature_student_rgb_fourier_skip_10k_v6.yaml` で opacity target / relax_rate を微調整。並行して勾配ノルム比と透過率ヒストグラムをログ化する。
 3. **P1 モデル強化ロードマップ**: v6 の評価を経て view-dependent 色ヘッド導入（方向エンコ／二段ヘッド）と projector 学習率の段階管理、feature 損失正規化を短期ランで仕上げ、効いた構成を 20k→100k へ展開。
 4. **P2 の運用底上げ**: グリッド段階化・重要度サンプリング・評価二本立て・CKA/SWA など中期施策を順次投入し、22 dB 台に乗る長期スケジュールを整備する。
+
+---
+
+## 2025-10-22 — View-dependent 学習ループ実装と短期テンプレート
+
+**概要**
+
+- `_KiloNeRFStudent` にレイ方向入力を受け付けるパスを追加し、方向エンコーディング（raw / Fourier）の設定値に応じて `MultiNetwork` へ late feed できるよう整備。
+- 学習ループ (`lego_response_distill.py`) でレイ方向を正規化し、サンプル数に合わせて展開してから学生モデルへ渡すよう更新。境界ブレンドの再サンプリング時も同じ方向を参照して一貫性を確保。
+- `StudentModel` ラッパーおよびシンプル・ハッシュ学生実装でも `ray_directions` をオプション引数として受け、API 互換性を維持。
+- オフライン検証ツール `tools/inspect_feature_alignment.py` も ray 方向を取り込み、学習時と同条件で特徴を観察可能にした。
+
+**新規コンフィグ**
+
+- `configs/generated/lego_feature_student_rgb_fourier_dir_v1.yaml` を追加。既存 10k 調整 (v6) をベースに `student.dir_encoding: fourier`, `student.dir_L: 4` を設定したサニティラン用テンプレート。ログ出力・ロス構成は v6 と同一。
+
+**サニティラン手順（提案）**
+
+1. 既存ログを削除:
+  ```bash
+  rm -rf logs/lego/feat_t_full/runs/student_rgb_fourier_dir_v1 \
+       results/lego/feat_t_full/runs/student_rgb_fourier_dir_v1
+  ```
+2. TensorBoard 待機:
+  ```bash
+  tensorboard --logdir logs/lego/feat_t_full/runs/student_rgb_fourier_dir_v1/tensorboard \
+          --host 127.0.0.1 --port 6006
+  ```
+3. 10k ラン実行:
+  ```bash
+  CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+  PYTHONHASHSEED=2025 KILOGS_LOG_INTERVAL=20 \
+  python -m distill.lego_response_distill \
+    --config configs/generated/lego_feature_student_rgb_fourier_dir_v1.yaml
+  ```
+
+**チェックポイント**
+
+- `loss/total` が v6 相当（≈0.22 台）で安定するか。
+- `loss/opacity` が 0.03 前後に収まるか、Alpha Guard が 0.13 付近で頭打ちになるか。
+- View-dependent ヘッド導入後も `training_metrics.csv`／TensorBoard のログが欠落しないか（初回ランで両方確認）。
+
+---
+
+## 2025-10-22 — TensorBoard グラフが空白になる場合のクリーンアップ手順
+
+**症状**
+
+- `events.out.tfevents.*` が 88B のまま増えず、TensorBoard UI にスカラー／グラフが一切表示されない。
+- `training_metrics.csv` も出力されない、または 1 行のみで止まる。
+
+**対処フロー**
+
+- 既存の TensorBoard プロセスを停止し、ブラウザを閉じる。
+- 対象 run のログを完全削除（例: `rm -rf logs/.../tensorboard logs/.../training_metrics.csv`）。`rm` の戻り値・ディレクトリが空になったことを `ls -al` で軽く確認。
+- ログディレクトリを改めて生成（`mkdir -p logs/.../tensorboard`）。空ディレクトリからスタートすることが重要。
+- 学習ジョブを再起動。`training_metrics.csv` と `.tfevents` のファイルサイズが伸びているか `ls -lh logs/.../tensorboard` で確認。
+- TensorBoard は **必ず** `tensorboard --logdir ... --host 127.0.0.1 --port 6006` のようにローカルホスト指定で立ち上げ直す。ブラウザのキャッシュも念のためリロード（Shift+F5 等）。
+
+**チェックポイント**
+
+- `logs/.../tensorboard/events.out.tfevents.*` が KB 単位で増え続けること。
+- `training_metrics.csv` にステップが順序通り追加されること。
+- 問題が続く場合は `KILOGS_DEBUG_TB=1` を指定して再実行し、`tb_debug.log` に `tb_base_emit` → `log_emit` が毎ステップ記録されているか確認する。
+
+**備考**
+
+- 古いイベントファイルが残ったままだと TensorBoard が空の run を監視し続けるので、「削除→再作成→再実行」を一連のセットで行う。
+- 複数 run の logdir をまとめて監視している場合は、対象 run だけを専用ディレクトリに分離してからクリーンアップすると切り分けが楽。
+
+---
+
+## 2025-10-22 — 応答蒸留先行→特徴蒸留再導入の方針
+
+- **順序**: まず色＋α＋深度の応答蒸留だけで 10k〜20k ランを調整し、α/深度ロスと view-dependent 追加後の挙動を安定化させる。
+- **ログ基盤**: この段階で TensorBoard／CSV／`tb_debug.log` を確認し、ログ欠落や閾値暴走が無い状態をベースラインとして記録する。
+- **特徴蒸留の再開条件**: 応答蒸留のみで総損失が横ばい〜僅かな下降、`loss/color` が 0.08 付近まで落ちる目処が立ったら feature pipeline を再有効化する。
+- **比較空間の次元**: 再導入時は教師 52ch → 64ch、学生 64ch → projector → 64ch とし、比較空間を 64 次元に統一する（128 次元へ戻す必要は無し）。
+- **テスト手順**: feature を戻す際は 1k〜2k の短縮ランで `feature_l2`/`feature_cos` が正しく出力されることを確認し、その後 10k ランへ拡張する。必要なら専用テンプレ（`*_feature64_v1.yaml` 等）を別途作成する。
+
+---
+
+## 2025-10-22 — 応答蒸留 10k ラン結果（dir_depth060_v1）
+
+- **ラン設定**: `configs/generated/lego_feature_student_rgb_fourier_dir_depth060_v1.yaml`（view-dependent fourier、hidden_dim=64、response-only）。`CUBLAS_WORKSPACE_CONFIG=:4096:8`, `PYTHONHASHSEED=2025`, `KILOGS_LOG_INTERVAL=20`。
+- **スカラー推移**:
+  - `loss/total`: 0.377 → 最小 0.178 (step 2334) → 終了 0.221。終盤は 0.22〜0.30 で小刻みに上下。
+  - `loss/color`: 0.141 → 最小 0.051 → 終了 0.060。last100 平均は 0.104 で若干戻り傾向。
+  - `loss/depth`: 0.0299 → 0.0238。last100 平均 0.0233 で安定。
+  - `loss/opacity`: 0.0497 → 0.0226。ターゲット 0.047 よりやや低めで推移。
+- **α 周り**: `alpha_penalty_weight` は 0.12 → 0.141 まで意図通り上昇。`alpha_guard_penalty` は最終 0.067（last100 平均 0.064）で制御できているが、一部ステップで 0.09 近くまで跳ね total を押し上げる箇所あり。
+- **成果物**: `logs/lego/feat_t_full/runs/student_rgb_fourier_dir_depth060_v1/` に full CSV と TB log、`results/.../checkpoints/step_005000.pth`, `step_010000.pth` を保存。
+- **所感**: view-dependent 追加でも応答蒸留のみで 0.22 台には到達。color loss が終盤で戻る点と α band penalty のスパイクを次の調整対象とする。
+
+---
+
+## 2025-10-22 — 次のアクションプラン
+
+1. **ログ分析**: TensorBoard で `loss/color` と `alpha_guard_penalty` の同時推移をチェックし、ペナルティが跳ねたフレームを画像確認（preview or render）。
+2. **α 調整案**: `alpha_guard.penalty_hi` や `relax_rate` を再微調整し、終盤のペナルティ跳ね上がりを抑える試走（5k〜10k）。
+3. **dirL スイープ**: `dirL2_v1` / `dirL6_v1` の 10k ランを実行し、方向周波数の違いによる color/total の比較を取得。
+4. **feature 再導入準備**:
+   - feature pipeline 用の 64ch 比較テンプレ（例: `lego_feature_student_rgb_fourier_dir_depth060_feature64_v1.yaml`）を作成。
+   - 1k〜2k の短縮ランで `feature_l2`/`feature_cos` がログされることを確認。
+5. **feature 付き 10k ラン**: view-dependent + feature 蒸留の組み合わせで 10k を回し、応答オンリーとの差分を評価。良好なら 20k〜50k へ拡張。
+6. **評価タスク**: レンダリング結果を `results/.../renders` に揃え、PSNR/SSIM の自動比較スクリプト（`tools/` 内）で教師との差を計測。
+
+---
+
+### Open Questions / Feedback Wanted
+
+- 応答蒸留のみで 0.22 台まで落ちたが、**この時点で feature 蒸留を導入するべきか**、それとも α 調整や dirL スイープで横ばい改善を先に詰めるべきか？ 0.20 を切る目標を考えると段階として妥当かどうか相談したい。
+- 比較空間を 64 次元に落とす案で問題ないか？ 教師 52ch → 64ch、学生 64ch → 64ch projector の設計について懸念点があれば指摘が欲しい。
+- dirL の周波数選択（L=2,4,6）で color loss に有意差が出るか不明。短期ランではどう評価すべきかガイドラインが欲しい。
+- α guard の跳ね上がり抑制は penalty_hi/relax_rate の調整で足りるか、それとも guard 自体のロジック（band_weight 等）の再設計が必要か検討してほしい。
+
+---
+
+## 2025-10-22 — Feedback Intake / Next 48h Plan
+
+- **P0（評価整合）最優先**: linear→sRGB 変換、α 合成、前景 PSNR、単視点 30 dB、EMA 限定評価を必ず揃える。学習改善の前に評価の一貫性を固める。
+- **応答蒸留での安定化が先**: 10k 終盤で `loss/total` が増加に転じない・`loss/color` ≲ 0.06 を確認してから feature 蒸留を再導入する。feature は土台が揺らいでいると負荷が大きい。
+- **α/深度制御の再調整**: weight を弱く遅く立ち上げ、ヒステリシスとスルーレート制限で α guard のスパイクを抑える。深度は前景限定＋Huber 幅拡大で反発を緩和。透過率ヒストグラムや勾配ノルム比を併せて監視。
+- **dirL スイープの評価軸**: L=2/4/6 を同条件で 10k ランし、終盤 1k の `loss/color` 平均・前景 PSNR・α スパイク頻度で比較。改善 5% 未満かスパイク増なら高次 L は却下。
+- **feature 比較空間**: 教師 52→64、生徒 64→projector→64 で十分。必要になってから 96 などへ拡張を検討。projector の LR は学生より低く設定し、安定後は凍結も視野。
+- **短期ロードマップ**:
+  1. Day1: α/深度調整ラン、dirL スイープ、projector LR/凍結の試走を 10k × 数本で検証。
+  2. Day2: 良好な設定を 20k へ延伸し、スケジュールを時間基準で再設計。EMA のみで評価し、worst-N 可視化と前景 PSNR をゲートに利用。
+  3. feature 再開は「単視点 30 dB」「loss/total 非増」「loss/color ≲ 0.06」「α スパイク低頻度」を満たしてから。導入時は cos→L2 の順で小さく立ち上げ、短縮ランでログ健全性を確認する。
+
+### Protocol Agreements（2025-10-22）
+
+**評価整合チェック**
+- 担当: 実行者本人。タイミング: 新設定で最初の 10k を走らせる前＋RUN開始日に 1 回。証跡は `research_notes.md` に「評価整合チェック済み」行を追記し、日付と根拠をメモ。
+- 手順:
+  1. 教師 1 視点で単視点オーバーフィット（PSNR ≥ 30 dB / EMA）。前景マスクは教師 α 積分ベース（主報告は教師マスク、補助で教師∧学生を併記可）。
+  2. linear↔sRGB 往復で教師=教師が PSNR=∞/SSIM=1/LPIPS=0。評価計算は linear RGB 限定（PNG ロード時はガンマチャンク無視・トーンマップ無し）。
+  3. アルファ合成を straight → 白背景合成（rgb*α+(1-α)）に固定し、教師=教師∞ を継続確認。
+  4. α 積分 > 0.7 などで前景 PSNR を算出し、白背景 PSNR と併記。
+  5. 以降の評価は EMA 重みのみを使用し、再開時は EMA も復元。Run ごとに seed / 学習コマンド / Torch & NumPy バージョン / 入力データハッシュを一行記録。
+
+**α 制御プロトコル**
+- `penalty_hi` / `relax_rate` の調整だけでなく、ガードのヒステリシスとスルーレート制限を導入。
+- 推奨設定: α 目標判定は EMA(0.9–0.98) を利用し、K=100 連続未達時のみ上げる。増分 Δ ≤ +0.002/step、減少はその半分。分位点（P75/P80）監視で散発的スパイクに対応。`effective_weight_cap` は 0.12–0.15 で頭打ち。
+- OK 判定: `alpha_guard_penalty` P90 ≤ 0.07・P99 ≤ 0.10、スパイク頻度 ≤ 2%、`opacity_target_weight_effective` が単調非減。
+
+**dirL スイープ評価**
+- 条件: seed / LR / chunk / projector 運用を固定し 10k で L=2/4/6 を比較。
+- 指標: (A) `loss/color` 終盤 1k 平均、(B) 前景 PSNR 終盤 1k 平均、(C) α スパイク頻度（許容 +1%以内）、(D) 勾配ノルム比（color:α:depth:dir ≈ 1:0.3:0.3:≤0.2）。方向ヘッド以外の容量は一定に保つ or 差分を結果解釈で明記。
+- 採択: (A) もしくは (B) が +5% 以上改善し、(C) が悪化しない最小 L を採用。改善 <5% か (C) 悪化なら低 L へ戻す。
+
+**feature 再導入ゲート**
+- 条件をすべて満たした後に投入: 単視点 PSNR ≥ 30 dB、10k/20k 終盤で `loss/total` 非増、`loss/color` ≲ 0.06、α スパイク頻度 ≤ 2%。
+- 比較空間は教師 52→64、生徒 64→projector→64。cosine を先に、小さな重みでゆっくり立ち上げ、L2 を後段で追加。projector LR は学生の ≤0.5 倍／必要に応じて凍結。短縮ラン（1〜2k）で `feature_l2` / `feature_cos` のログ健全性を確認してから 10k へ延ばす。
+
+### Run Continuation Rules
+- **停止条件**: 終盤 1k の `loss/total` 傾きが正・`alpha_guard_penalty` P95 上昇・`loss/color` 底打ちが確認された場合は設定見直し。
+- **20k 延長条件**: `loss/color` が単調減、α が頭打ちで安定、前景 PSNR が上向き。worst-N 可視化で方向依存残差が縮小していること。
+- **feature 再導入 GO/NO-GO**: 上記ゲート 4 項目＋20k での Go 判定を満たした時点で cos → L2 の順に段階導入。導入後も α スパイクや `loss/total` の反発が見えたら即停止し設定を戻す。
+- **落とし穴メモ**: EMA 復元忘れ／pre-multiplied 混在／dirL 変更でヘッド容量が変動／前景 PSNR を学生マスクで算出する誤りに注意。常に教師マスク基準を主報告とし、容量差は結果解釈で但し書き。
+
+**次アクション案**
+
+1. `dir_L` を 2/6 に振って 10k ランを比較し、方向周波数がノイズ化していないか評価する。
+2. 勾配ノルムログに ray 方向ブランチを追加し、色ヘッドと密度ヘッドの寄与比を確認する。
+3. 有効と判断した構成を 20k テンプレートへ拡張し、cosine スケジュールの長さや warmup をスケーリングした上で再評価する。
+
+---
+
+## 2025-10-22 — フィードバック統合（評価から運用までの短期戦略）
+
+**結論（最短ルート）**
+
+- まず **P0: 評価整合** を固める。linear / sRGB 変換、α 合成、前景 PSNR、単視点オーバーフィット、EMA 限定評価を揃えない限り、どれだけ学習しても PSNR が伸びないリスクが高い。
+- 次に **P1: α / 深度スケール** を調整する。重みと立ち上がりの遅延、前景限定の深度、勾配ノルム比の監視で total loss 終盤の反発を抑える。
+- 並行して **view-dependent 安定化** を進め、方向エンコ次数 L、色ヘッドと密度ヘッドの寄与バランス、projector の凍結タイミングを詰める。
+
+**P0（評価およびスケールの健全性）**
+
+- PNG 読み込み〜sRGB→linear 変換を教師 / 学生で完全一致させる。トーンマッピングやガンマ補正も評価時に揃える。
+- α 合成は pre-multiplied/straight を含め統一し、白背景合成の順序と丸めを意識する。前景マスク付き PSNR を常設して背景支配を検知する。
+- 単視点オーバーフィット（30 dB 超）を短時間で再現し、モデルではなく評価やスケールが律速になっていないかを確認する。
+- 評価は EMA のみで行い、非 EMA と乖離するならスケジュールやノイズを見直す。
+- 教師の SH 係数スケールや露出基準が学生側の色空間と一致しているかを再確認する。
+
+**P1（α / 深度バランス）**
+
+- α 損失は重みを弱め、立ち上がりを遅らせ、目標値への到達は滑らかにする。最大重みの頭打ちとヒステリシスを明確化して終盤の反発を抑える。
+- 深度損失は α 積分が閾値以上の前景画素だけで評価し、Huber 幅を広げて遠景ノイズに引っ張られないようにする。
+- 勾配ノルム比（color:α:depth ≈ 1:0.3:0.3）を常時ログし、乖離したら即重みやスケジュールを補正する。
+- σ 初期化は負バイアス＋shifted-softplus で霧を抑え、透過率ヒストグラムを監視して「白い霧」の再発を早期検知する。
+
+**P2（モデルの効かせ方）**
+
+- View-independent 密度と late fusion の色ヘッドを分け、方向ブランチの寄与は初期は弱く遅めに増やす。
+- 方向エンコ次数 L を低・中・高で 10k ラン比較し、高 L でノイズ化したら即戻す。
+- 位置 skip の対象層は中段へ固定し、初段を過密にしない（初期安定性優先）。
+- Projector の学習率は学生より低めに設定し、必要に応じてウォームアップ後に凍結する。動き続けると収束がぶれる。
+- Feature 損失はチャネルごとに z-score / 白色化を施し、コサイン → L2 の順で段階的に効かせる。
+
+**P3（サンプリング / グリッド）**
+
+- near / far とサンプル本数は漸増させ、初期は軽く終盤で濃くする。密度安定 → 色精緻化の順を守る。
+- KiloNeRF グリッドは coarse→fine の段階化で重い構成は色と向きが落ち着いてから投入する。
+- 残差や重要度サンプリングで worst-N 画素・角度に追加サンプルを割り当て、終盤の改善余地を狙う。
+
+**P4（診断の三本柱）**
+
+1. 透過率ヒストグラム（ステップ別）
+2. 各損失の勾配ノルム比（色 / α / 深度 / 方向ブランチ）
+3. worst-N 可視化（フレーム・パッチ）
+
+加えて CKA で教師 / 学生特徴の整合を定点観測し、projector 凍結判断の根拠にする。
+
+**P5（短期プラン：2 日で握る）**
+
+- Day1（10k × 3 本）
+  1. v6 基準で深度重みを 0.06〜0.08 に調整
+  2. 方向 L を ±2 でスイープ（寄与は遅め開始）
+  3. projector 凍結あり / なし
+  → 指標: loss/total 終盤の反発有無、color loss の底、α ガードの頭打ち挙動
+
+  *Config memo*: `configs/generated/lego_feature_student_rgb_fourier_dir_depth060_v1.yaml`（深度 0.06）、`.../dirL2_v1.yaml`、`.../dirL6_v1.yaml` を Day1 試行のテンプレとして追加済み。
+
+- Day2（10k → 20k の橋渡し）
+  4. Day1 の勝ち設定を 20k にスケール（LR / warmup を等価時間に再設計）
+  5. 前景 PSNR / 白 PSNR の二本ゲートで EMA 評価
+  6. worst-N で方向依存の残差が残るなら L を再調整または色ヘッド寄与を微増
+
+**P6（詰み回避の運用）**
+
+- 10k で下降傾向が消えたら止める。惰性で 50k/100k まで引っ張らない。
+- CSV 行数・TensorBoard 折れ線・勾配ノルム比の三点を同時確認し、欠けたら評価を信用しない。
+- ランごとに logdir を新設し、既存 events / CSV は都度退避して再現性を維持する。
+
+**しきい値（目安）**
+
+- 単視点オーバーフィット: PSNR ≥ 30 dB（数百〜数千 step）
+- 10k 短期: loss/total が横ばい〜微減、color loss が単調減、α ガードが頭打ちで安定
+- 20k 中期: 前景 PSNR が白 PSNR を上回り、LPIPS が 0.20 台前半に入る兆し
+
+上記を順守すれば、現在の「終盤で total が反発する」症状は高確率で解消できる見通し。
+
 
 ### 運用ルール（2025-10-22 更新）
 

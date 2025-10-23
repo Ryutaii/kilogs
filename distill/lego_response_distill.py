@@ -568,6 +568,14 @@ class StudentConfig:
     hash_log2_hashmap_size: int = 19
     hash_base_resolution: int = 16
     hash_per_level_scale: float = 1.5
+    pos_encoding: str = "none"
+    pos_L: int = 0
+    dir_encoding: str = "none"
+    dir_L: int = 0
+    skips: Tuple[int, ...] = tuple()
+    mlp_hidden: Tuple[int, ...] = tuple()
+    sigma_activation: str = "relu"
+    sigma_bias: Optional[float] = None
 
 
 @dataclass
@@ -700,6 +708,7 @@ class LossConfig:
     color_weight: float
     opacity_weight: float
     color_type: str = "l2"
+    color_eps: float = 1e-3
     opacity_type: str = "l1"
     temperature: float = 1.0
     opacity_temperature: Optional[float] = None
@@ -725,6 +734,7 @@ class LossConfig:
     opacity_target_warm_start_offset: int = 0
     background_color: Optional[Tuple[float, float, float]] = None
     opacity_target_hysteresis: bool = True
+    opacity_target_max_weight: Optional[float] = None
 
 
 @dataclass
@@ -782,11 +792,29 @@ class OpacityTargetScheduler:
         lower_bound = min(start_weight, target_weight)
         upper_bound = max(start_weight, target_weight)
 
+        cap_raw = getattr(cfg, "opacity_target_max_weight", None)
+        cap_value: Optional[float]
+        if cap_raw is None:
+            cap_value = None
+        else:
+            try:
+                cap_value = float(cap_raw)
+            except (TypeError, ValueError):
+                cap_value = None
+            if cap_value is not None and cap_value < 0.0:
+                cap_value = 0.0
+        if cap_value is not None:
+            start_weight = min(start_weight, cap_value)
+            target_weight = min(target_weight, cap_value)
+            upper_bound = min(upper_bound, cap_value)
+
         if not increasing:
             self.max_weight = None
 
         def _apply_monotonic(candidate: float, allow_hysteresis: bool = True) -> float:
             value = max(0.0, float(candidate))
+            if cap_value is not None:
+                value = min(value, cap_value)
             if increasing:
                 value = max(value, start_weight)
                 if self.last_weight is not None:
@@ -1794,7 +1822,11 @@ class _SimpleMLPStudent(torch.nn.Module):
         self.last_input: Optional[torch.Tensor] = None
         self.last_pre_activation: Optional[torch.Tensor] = None
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        ray_directions: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         self.last_input = x
         out = self.mlp(x)
         self.last_pre_activation = out
@@ -1846,7 +1878,11 @@ class _HashGridStudent(torch.nn.Module):
         self.last_input: Optional[torch.Tensor] = None
         self.last_pre_activation: Optional[torch.Tensor] = None
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        ray_directions: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         if not x.is_contiguous():
             x = x.contiguous()
         self.last_input = x
@@ -1902,6 +1938,56 @@ class _KiloNeRFStudent(torch.nn.Module):
         hidden_dim = int(cfg.hidden_dim)
         num_layers = max(int(cfg.num_layers), 1)
 
+        pos_encoding = str(getattr(cfg, "pos_encoding", "none") or "none").lower()
+        pos_levels = max(int(getattr(cfg, "pos_L", 0) or 0), 0)
+        if pos_encoding in {"fourier", "positional", "sin", "sinusoidal"} and pos_levels > 0:
+            freq_bands = torch.pow(2.0, torch.arange(pos_levels, dtype=torch.float32))
+            self.register_buffer("position_freq_bands", freq_bands, persistent=False)
+            position_channels = 3 + 3 * 2 * pos_levels
+        else:
+            pos_encoding = "none"
+            pos_levels = 0
+            self.register_buffer("position_freq_bands", torch.empty(0, dtype=torch.float32), persistent=False)
+            position_channels = 3
+
+        self.position_encoding = pos_encoding
+        self.pos_levels = pos_levels
+        self.position_channels = position_channels
+
+        dir_encoding = str(getattr(cfg, "dir_encoding", "none") or "none").lower()
+        dir_levels = max(int(getattr(cfg, "dir_L", 0) or 0), 0)
+        if dir_encoding in {"fourier", "positional", "sin", "sinusoidal"} and dir_levels > 0:
+            dir_freq_bands = torch.pow(2.0, torch.arange(dir_levels, dtype=torch.float32))
+            self.register_buffer("direction_freq_bands", dir_freq_bands, persistent=False)
+            direction_channels = 3 + 3 * 2 * dir_levels
+        elif dir_encoding in {"raw", "identity", "linear"}:
+            dir_levels = 0
+            self.register_buffer("direction_freq_bands", torch.empty(0, dtype=torch.float32), persistent=False)
+            direction_channels = 3
+        else:
+            dir_encoding = "none"
+            dir_levels = 0
+            self.register_buffer("direction_freq_bands", torch.empty(0, dtype=torch.float32), persistent=False)
+            direction_channels = 0
+
+        self.direction_encoding = dir_encoding
+        self.dir_levels = dir_levels
+        self.direction_channels = direction_channels
+
+        skip_candidates: Tuple[int, ...] = tuple(
+            int(v) for v in getattr(cfg, "skips", tuple()) if isinstance(v, (int, float))
+        )
+        self.refeed_position_index: Optional[int] = None
+        if num_layers > 1 and skip_candidates:
+            primary_layer = max(int(skip_candidates[0]), 1)
+            target_layer = min(max(primary_layer, 2), num_layers)
+            self.refeed_position_index = target_layer - 2
+        else:
+            self.refeed_position_index = None
+
+        self.sigma_activation = str(getattr(cfg, "sigma_activation", "relu") or "relu").lower()
+        sigma_bias_value = float(cfg.sigma_bias if cfg.sigma_bias is not None else cfg.density_bias)
+
         gx, gy, gz = self.grid_resolution
         self.linear_index_multipliers = (1, gx, gx * gy)
         grid_resolution_tensor = torch.tensor([gx, gy, gz], dtype=torch.float32)
@@ -1922,12 +2008,12 @@ class _KiloNeRFStudent(torch.nn.Module):
         implementation = "multimatmul_differentiable"
         self.network = MultiNetwork(
             num_networks=self.num_cells,
-            num_position_channels=3,
-            num_direction_channels=0,
+            num_position_channels=self.position_channels,
+            num_direction_channels=self.direction_channels,
             num_output_channels=4,
             hidden_layer_size=hidden_dim,
             num_hidden_layers=num_layers,
-            refeed_position_index=None,
+            refeed_position_index=self.refeed_position_index,
             late_feed_direction=True,
             direction_layer_size=hidden_dim,
             nonlinearity=activation,
@@ -1941,8 +2027,9 @@ class _KiloNeRFStudent(torch.nn.Module):
             use_view_independent_color=False,
         )
 
-        self.register_buffer("density_bias", torch.tensor(cfg.density_bias))
-        self.register_buffer("color_bias", torch.tensor(cfg.color_bias))
+        self.register_buffer("density_bias", torch.tensor(float(cfg.density_bias)))
+        self.register_buffer("sigma_bias", torch.tensor(sigma_bias_value))
+        self.register_buffer("color_bias", torch.tensor(float(cfg.color_bias)))
         self.hidden_activation = str(cfg.activation).lower()
         self.last_input: Optional[torch.Tensor] = None
         self.last_pre_activation: Optional[torch.Tensor] = None
@@ -1950,6 +2037,8 @@ class _KiloNeRFStudent(torch.nn.Module):
         self.last_penultimate_pre: Optional[torch.Tensor] = None
         self.last_penultimate_post: Optional[torch.Tensor] = None
         self.last_penultimate: Optional[torch.Tensor] = None
+        self.last_ray_directions: Optional[torch.Tensor] = None
+        self.last_encoded_directions: Optional[torch.Tensor] = None
         self._penultimate_sorted_pre: Optional[torch.Tensor] = None
         self._penultimate_sorted_post: Optional[torch.Tensor] = None
         self._feature_hook = None
@@ -1980,10 +2069,68 @@ class _KiloNeRFStudent(torch.nn.Module):
         self._penultimate_sorted_post = self._apply_hidden_activation(output)
         return output
 
+    def _encode_positions(self, coords: torch.Tensor) -> torch.Tensor:
+        if self.position_encoding != "fourier" or self.pos_levels <= 0 or self.position_freq_bands.numel() == 0:
+            return coords
+        if coords.numel() == 0:
+            return coords.new_empty((coords.shape[0], self.position_channels))
+        freq = self.position_freq_bands.to(device=coords.device, dtype=coords.dtype)
+        scaled = coords.unsqueeze(-1) * freq  # (..., 3, L)
+        scaled = scaled * math.pi
+        sin_terms = torch.sin(scaled)
+        cos_terms = torch.cos(scaled)
+        sin_flat = sin_terms.reshape(coords.shape[0], -1)
+        cos_flat = cos_terms.reshape(coords.shape[0], -1)
+        return torch.cat([coords, sin_flat, cos_flat], dim=-1)
+
+    def _encode_directions(
+        self,
+        directions: Optional[torch.Tensor],
+        *,
+        count: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if count == 0:
+            return torch.zeros((0, self.direction_channels), device=device, dtype=dtype)
+        if self.direction_channels == 0:
+            return torch.zeros((count, 0), device=device, dtype=dtype)
+        if directions is None:
+            return torch.zeros((count, self.direction_channels), device=device, dtype=dtype)
+        if directions.ndim != 2 or directions.shape[-1] != 3:
+            raise ValueError("ray_directions must be shaped (N, 3)")
+        if directions.shape[0] != count:
+            raise ValueError("ray_directions count must match sample count")
+        dirs = directions.to(device=device, dtype=dtype)
+        dirs = F.normalize(dirs, dim=-1, eps=1e-6)
+        if self.direction_encoding != "fourier" or self.dir_levels <= 0 or self.direction_freq_bands.numel() == 0:
+            return dirs
+        freq = self.direction_freq_bands.to(device=device, dtype=dtype)
+        scaled = dirs.unsqueeze(-1) * freq * math.pi
+        sin_terms = torch.sin(scaled)
+        cos_terms = torch.cos(scaled)
+        sin_flat = sin_terms.reshape(dirs.shape[0], -1)
+        cos_flat = cos_terms.reshape(dirs.shape[0], -1)
+        return torch.cat([dirs, sin_flat, cos_flat], dim=-1)
+
+    def _activate_sigma(self, tensor: torch.Tensor) -> torch.Tensor:
+        activation = self.sigma_activation
+        if activation in {"relu", "rectified"}:
+            return torch.relu(tensor)
+        if activation == "softplus":
+            return F.softplus(tensor)
+        if activation in {"shifted_softplus", "softplus_shifted"}:
+            value = F.softplus(tensor) - math.log(2.0)
+            return torch.clamp(value, min=0.0)
+        if activation in {"identity", "linear", "none"}:
+            return torch.clamp(tensor, min=0.0)
+        return torch.relu(tensor)
+
     def _query_network(
         self,
         lin_idx: torch.Tensor,
         coords: torch.Tensor,
+        ray_directions: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if lin_idx.numel() == 0:
             return coords.new_zeros((0, 4))
@@ -2005,10 +2152,23 @@ class _KiloNeRFStudent(torch.nn.Module):
             batch_size_per_network[unique_cells] = counts
         batch_size_cpu = batch_size_per_network.to(torch.device("cpu"))
 
-        directions = local_coords.new_zeros((local_coords.shape[0], 0))
+        encoded_positions = self._encode_positions(local_coords)
+        dirs_sorted: Optional[torch.Tensor] = None
+        if ray_directions is not None:
+            if ray_directions.ndim != 2 or ray_directions.shape[-1] != 3:
+                raise ValueError("ray_directions must be shaped (N, 3)")
+            if ray_directions.shape[0] != coords.shape[0]:
+                raise ValueError("ray_directions count must match coords count")
+            dirs_sorted = ray_directions[sorted_perm]
+        encoded_directions = self._encode_directions(
+            dirs_sorted,
+            count=coords_sorted.shape[0],
+            device=device,
+            dtype=dtype,
+        )
         self._penultimate_sorted_pre = None
         self._penultimate_sorted_post = None
-        raw_sorted = self.network([local_coords, directions], batch_size_cpu)
+        raw_sorted = self.network([encoded_positions, encoded_directions], batch_size_cpu)
 
         outputs = torch.empty_like(raw_sorted)
         outputs[sorted_perm] = raw_sorted
@@ -2020,6 +2180,11 @@ class _KiloNeRFStudent(torch.nn.Module):
         if self._penultimate_sorted_post is not None:
             penultimate_post_unsorted = torch.empty_like(self._penultimate_sorted_post)
             penultimate_post_unsorted[sorted_perm] = self._penultimate_sorted_post
+        if encoded_directions.numel() == 0:
+            encoded_unsorted = encoded_directions
+        else:
+            encoded_unsorted = torch.empty_like(encoded_directions)
+            encoded_unsorted[sorted_perm] = encoded_directions
         self.last_penultimate_pre = penultimate_pre_unsorted
         self.last_penultimate_post = penultimate_post_unsorted
         if penultimate_post_unsorted is not None:
@@ -2028,17 +2193,34 @@ class _KiloNeRFStudent(torch.nn.Module):
             self.last_penultimate = penultimate_pre_unsorted
         else:
             self.last_penultimate = None
+        self.last_encoded_directions = encoded_unsorted
         return outputs
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        ray_directions: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         if x.ndim != 2 or x.shape[-1] != 3:
             raise ValueError("Input to kilo_uniform_mlp student must be shaped (N, 3)")
 
+        self.last_ray_directions = None
+        self.last_encoded_directions = None
         if x.numel() == 0:
             return x.new_zeros((0, 3)), x.new_zeros((0, 1))
 
         device = x.device
         dtype = x.dtype
+
+        ray_dirs: Optional[torch.Tensor]
+        if ray_directions is None:
+            ray_dirs = None
+        else:
+            if ray_directions.ndim != 2 or ray_directions.shape[-1] != 3:
+                raise ValueError("ray_directions must be shaped (N, 3)")
+            if ray_directions.shape[0] != x.shape[0]:
+                raise ValueError("ray_directions count must match input sample count")
+            ray_dirs = F.normalize(ray_directions.to(device=device, dtype=dtype), dim=-1, eps=1e-6)
 
         coords = x.clamp(0.0, 1.0 - 1e-6)
         grid_res = self.grid_resolution_float.to(device=device, dtype=dtype)
@@ -2057,14 +2239,15 @@ class _KiloNeRFStudent(torch.nn.Module):
         self.last_input = x
         self.last_linear_indices = lin_idx
 
-        base_outputs = self._query_network(lin_idx, coords)
+        base_outputs = self._query_network(lin_idx, coords, ray_dirs)
         primary_penultimate = self.last_penultimate
         primary_penultimate_pre = self.last_penultimate_pre
         primary_penultimate_post = self.last_penultimate_post
         self.last_pre_activation = base_outputs
+        self.last_ray_directions = ray_dirs
 
         rgb = torch.sigmoid(base_outputs[:, :3] + self.color_bias)
-        sigma = torch.relu(base_outputs[:, 3:] + self.density_bias)
+        sigma = self._activate_sigma(base_outputs[:, 3:] + self.sigma_bias)
 
         if self.boundary_blend_enabled and self.boundary_blend_margin > 0.0:
             margin = self.boundary_blend_margin
@@ -2107,9 +2290,10 @@ class _KiloNeRFStudent(torch.nn.Module):
                 )
 
                 neighbor_coords = coords.index_select(0, sample_idx)
-                neighbor_outputs = self._query_network(lin_neighbor, neighbor_coords)
+                neighbor_dirs = None if ray_dirs is None else ray_dirs.index_select(0, sample_idx)
+                neighbor_outputs = self._query_network(lin_neighbor, neighbor_coords, neighbor_dirs)
                 neighbor_rgb = torch.sigmoid(neighbor_outputs[:, :3] + self.color_bias)
-                neighbor_sigma = torch.relu(neighbor_outputs[:, 3:] + self.density_bias)
+                neighbor_sigma = self._activate_sigma(neighbor_outputs[:, 3:] + self.sigma_bias)
 
                 w = weight_tensor.index_select(0, sample_idx).unsqueeze(-1).clamp(0.0, 1.0)
                 base_rgb = current_rgb.index_select(0, sample_idx)
@@ -2180,8 +2364,12 @@ class StudentModel(torch.nn.Module):
         else:
             self.impl = _SimpleMLPStudent(cfg)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.impl(x)
+    def forward(
+        self,
+        x: torch.Tensor,
+        ray_directions: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.impl(x, ray_directions=ray_directions)
 
 
 def parse_config(path: Path):
@@ -2239,13 +2427,65 @@ def parse_config(path: Path):
         render_stats=Path(raw["teacher"]["render_stats"]),
     )
     student_section = raw["student"]
+    grid_resolution_raw = student_section.get("grid_resolution", (128, 128, 128))
+    grid_resolution = tuple(int(v) for v in grid_resolution_raw)
+
+    mlp_hidden_raw = student_section.get("mlp_hidden")
+    if isinstance(mlp_hidden_raw, (list, tuple)):
+        mlp_hidden_values = []
+        for value in mlp_hidden_raw:
+            parsed = _coerce_optional_int(value)
+            if parsed is not None and parsed > 0:
+                mlp_hidden_values.append(parsed)
+        mlp_hidden = tuple(mlp_hidden_values)
+    else:
+        mlp_hidden = tuple()
+
+    hidden_default = mlp_hidden[0] if mlp_hidden else 64
+    num_layers_default = len(mlp_hidden) if mlp_hidden else 4
+    hidden_dim = int(student_section.get("hidden_dim", hidden_default))
+    num_layers = int(student_section.get("num_layers", num_layers_default))
+
+    density_bias_raw = student_section.get("density_bias")
+    sigma_bias_raw = student_section.get("sigma_bias", density_bias_raw)
+    density_bias = float(density_bias_raw if density_bias_raw is not None else -1.0)
+    sigma_bias_value = _coerce_float(sigma_bias_raw, density_bias)
+    if sigma_bias_value is None:
+        sigma_bias_value = density_bias
+
+    skips_raw = student_section.get("skips", [])
+    if isinstance(skips_raw, (list, tuple)):
+        skips_values: List[int] = []
+        for candidate in skips_raw:
+            parsed = _coerce_optional_int(candidate)
+            if parsed is not None:
+                skips_values.append(parsed)
+        skips_tuple = tuple(skips_values)
+    else:
+        parsed_skip = _coerce_optional_int(skips_raw)
+        skips_tuple = (parsed_skip,) if parsed_skip is not None else tuple()
+
+    pos_encoding = str(student_section.get("pos_encoding", "none") or "none")
+    dir_encoding = str(student_section.get("dir_encoding", "none") or "none")
+    try:
+        pos_L_value = int(student_section.get("pos_L", 0) or 0)
+    except (TypeError, ValueError):
+        pos_L_value = 0
+    pos_L_value = max(pos_L_value, 0)
+    try:
+        dir_L_value = int(student_section.get("dir_L", 0) or 0)
+    except (TypeError, ValueError):
+        dir_L_value = 0
+    dir_L_value = max(dir_L_value, 0)
+    sigma_activation_value = str(student_section.get("sigma_activation", student_section.get("density_activation", "relu")) or "relu")
+
     student = StudentConfig(
         type=student_section["type"],
-        grid_resolution=tuple(student_section.get("grid_resolution", (128, 128, 128))),
-        hidden_dim=int(student_section.get("hidden_dim", 64)),
-        num_layers=int(student_section.get("num_layers", 4)),
+        grid_resolution=grid_resolution,
+        hidden_dim=hidden_dim,
+        num_layers=num_layers,
         activation=student_section.get("activation", "relu"),
-        density_bias=float(student_section.get("density_bias", -1.0)),
+        density_bias=density_bias,
         color_bias=float(student_section.get("color_bias", 0.0)),
         regularization_weight=float(student_section.get("regularization_weight", 0.0)),
         enable_boundary_blend=bool(student_section.get("enable_boundary_blend", False)),
@@ -2255,6 +2495,14 @@ def parse_config(path: Path):
         hash_log2_hashmap_size=int(student_section.get("hash_log2_hashmap_size", 19)),
         hash_base_resolution=int(student_section.get("hash_base_resolution", 16)),
         hash_per_level_scale=float(student_section.get("hash_per_level_scale", 1.5)),
+        pos_encoding=pos_encoding,
+        pos_L=pos_L_value,
+        dir_encoding=dir_encoding,
+        dir_L=dir_L_value,
+        skips=skips_tuple,
+        mlp_hidden=mlp_hidden,
+        sigma_activation=sigma_activation_value,
+        sigma_bias=sigma_bias_value,
     )
     train_section = raw["train"]
     max_steps_value = int(train_section.get("max_steps", 0))
@@ -2596,10 +2844,19 @@ def parse_config(path: Path):
     else:
         opacity_target_hysteresis = bool(hysteresis_raw)
 
+    color_eps_value = _coerce_float(color_raw.get("eps", color_raw.get("epsilon")), 1e-3)
+    if color_eps_value is None or color_eps_value <= 0.0:
+        color_eps_value = 1e-3
+
+    opacity_max_weight = _coerce_float(opacity_raw.get("max_weight"))
+    if opacity_max_weight is not None and opacity_max_weight < 0.0:
+        opacity_max_weight = 0.0
+
     loss_cfg = LossConfig(
         color_weight=float(color_raw["weight"]),
         opacity_weight=float(opacity_raw["weight"]),
         color_type=color_raw.get("type", "l2"),
+        color_eps=float(color_eps_value),
         opacity_type=opacity_raw.get("type", "l1"),
         temperature=float(loss_raw.get("distillation_temperature", 1.0)),
         opacity_temperature=(
@@ -2636,6 +2893,7 @@ def parse_config(path: Path):
     opacity_target_warm_start_offset=opacity_target_warm_start_offset,
         background_color=background_color_tuple,
         opacity_target_hysteresis=opacity_target_hysteresis,
+        opacity_target_max_weight=opacity_max_weight,
     )
     feature_raw = raw.get("feature_pipeline", {})
     threshold_raw = feature_raw.get("boundary_mask_threshold", 0.75)
@@ -2903,6 +3161,10 @@ def compute_losses(
         color_loss = torch.nn.functional.mse_loss(student_rgb, teacher_rgb)
     elif cfg.color_type == "l1":
         color_loss = torch.nn.functional.l1_loss(student_rgb, teacher_rgb)
+    elif cfg.color_type == "charbonnier":
+        eps = float(getattr(cfg, "color_eps", 1e-3) or 1e-3)
+        diff = student_rgb - teacher_rgb
+        color_loss = torch.sqrt(diff * diff + eps * eps).mean()
     else:
         raise ValueError(f"Unsupported color loss type: {cfg.color_type}")
     losses["color"] = cfg.color_weight * color_loss
@@ -3216,6 +3478,7 @@ def train(
             flush=True,
         )
     feature_aux_source_warned = False
+    feature_mask_fraction_missing_warned = False
     if feature_pipeline_active:
         wants_gaussian_features = feature_cfg.teacher_mode.startswith("gaussian") or bool(feature_cfg.teacher_components)
 
@@ -3821,12 +4084,15 @@ def train(
         )
     train_cfg.promotion_gates = gate_resolution.gates
 
+    if not feature_pipeline_active:
+        if train_cfg.promotion_gates:
+            print(
+                "[gate] feature pipeline disabled; ignoring promotion_gates",
+                flush=True,
+            )
+        train_cfg.promotion_gates = tuple()
+
     promotion_active = bool(train_cfg.promotion_gates)
-    if promotion_active and not feature_pipeline_active:
-        raise TrainingAbort(
-            "Promotion gates require the feature pipeline to be enabled.",
-            exit_code=train_cfg.promotion_exit_code,
-        )
     if promotion_active and train_cfg.promotion_min_mask_fraction <= 0.0:
         raise TrainingAbort(
             "promotion_min_mask_fraction must be positive when promotion gates are active.",
@@ -4040,54 +4306,13 @@ def train(
             _add_scalar("loss/total", total_loss_val)
 
         if full:
-            for loss_key in ("color", "opacity", "depth"):
+            for loss_key in ("color", "opacity", "depth", "feature_recon", "feature_cosine"):
                 _add_scalar(f"loss/{loss_key}", metrics_source.get(loss_key))
-            for feature_key in ("feature_recon", "feature_cosine"):
-                _add_scalar(f"loss/{feature_key}", metrics_source.get(feature_key))
 
             scalar_map = {
-                "learning_rate": "train/learning_rate",
-                "opacity_target_weight_effective": "opacity/target_weight_effective",
-                "feature_weight_effective": "feature/weight_effective",
-                "feature_cos_weight_effective": "feature/cos_weight_effective",
-                "feature_mask_fraction": "feature_mask/fraction",
-                "feature_mask_threshold": "feature_mask/threshold",
-                "feature_mask_soft_transition": "feature_mask/soft_transition",
-                "feature_mask_weight_mean": "feature_mask/weight_mean",
-                "feature_mask_weight_min": "feature_mask/weight_min",
-                "feature_mask_weight_max": "feature_mask/weight_max",
-                "mask_emergency_active": "feature_mask/emergency_active",
-                "mask_emergency_count": "feature_mask/emergency_count",
-                "mask_low_fraction_streak": "feature_mask/low_streak",
-                "phase_index": "phase/index",
-                "phase_feature_scale": "phase/feature_scale",
-                "phase_mask_override": "phase/mask_override",
-                "alpha_mean": "opacity/alpha_mean",
-                "alpha_fraction_ge95": "opacity/alpha_fraction_ge95",
-                "alpha_fraction_le05": "opacity/alpha_fraction_le05",
-                "alpha_band_penalty": "opacity/alpha_band_penalty",
                 "alpha_guard_penalty": "opacity/alpha_guard_penalty",
-                "alpha_fraction_mid": "opacity/alpha_fraction_mid",
-                "alpha_penalty_core": "opacity/alpha_penalty_core",
-                "alpha_penalty_weight": "opacity/alpha_penalty_weight",
-                "alpha_guard_avg_penalty": "opacity/alpha_guard_avg",
-                "opacity_target_weight_base": "opacity/target_weight_base",
                 "opacity_target_weight_effective": "opacity/target_weight_effective",
-                "opacity_target_adjustment": "opacity/target_weight_adjustment",
-                "opacity_lambda_runtime": "opacity/lambda_runtime",
-                "feature_on_steps": "feature/on_steps",
-                "feature_schedule_terminal": "feature/schedule_terminal",
-                "opacity_on_steps": "opacity/on_steps",
-                "opacity_schedule_terminal": "opacity/schedule_terminal",
-                "mask_prefail_active": "feature_mask/prefail_active",
-                "mask_prefail_count": "feature_mask/prefail_count",
-                "mask_prefail_drop_rate": "feature_mask/prefail_drop_rate",
-                "mask_prefail_min_rate": "feature_mask/prefail_min_rate",
-                "mask_prefail_threshold": "feature_mask/prefail_threshold",
-                "mask_prefail_variance": "feature_mask/prefail_variance",
             }
-            for _, avg_key, tag in moving_average_specs:
-                scalar_map[avg_key] = tag
             for metric_key, tb_tag in scalar_map.items():
                 _add_scalar(tb_tag, metrics_source.get(metric_key))
 
@@ -4708,10 +4933,16 @@ def train(
             pts_norm = (pts - bbox_min) / bbox_extent
             pts_norm = pts_norm.clamp(0.0, 1.0)
             pts_flat = pts_norm.view(-1, 3)
+            ray_dirs = F.normalize(rays_d, dim=-1, eps=1e-6)
+            ray_dirs_flat = (
+                ray_dirs[:, None, :]
+                .expand(-1, data_cfg.samples_per_ray, -1)
+                .reshape(-1, 3)
+            )
 
             if not first_forward_logged:
                 progress.write("[init] Entering first KiloNeRF forward pass (may take several minutes).")
-            student_rgb_samples, student_sigma_samples = student_model(pts_flat)
+            student_rgb_samples, student_sigma_samples = student_model(pts_flat, ray_dirs_flat)
             if not first_forward_logged:
                 progress.write("[init] First KiloNeRF forward pass finished; continuing with training loop.")
                 if progress_initially_hidden and getattr(progress, "disable", False):
@@ -5695,14 +5926,30 @@ def train(
                 }
                 required_fraction = fraction_targets.get(global_step)
                 if required_fraction is not None:
-                    if feature_mask_fraction_value is None:
-                        raise RuntimeError(
-                            f"feature_mask_fraction unavailable at step {global_step}; cannot validate mask coverage"
-                        )
-                    if feature_mask_fraction_value < required_fraction:
-                        raise RuntimeError(
-                            f"feature mask fraction {feature_mask_fraction_value:.4f} below required {required_fraction:.2f} at step {global_step}"
-                        )
+                    effective_mask_fraction = feature_mask_fraction_value
+                    if effective_mask_fraction is None and last_feature_mask_fraction_value is not None:
+                        effective_mask_fraction = last_feature_mask_fraction_value
+                        if not feature_mask_fraction_missing_warned:
+                            progress.write(
+                                "[feature_pipeline] feature_mask_fraction missing for current step; reusing the last recorded value."
+                            )
+                            feature_mask_fraction_missing_warned = True
+                    if effective_mask_fraction is None:
+                        if not feature_mask_fraction_missing_warned:
+                            progress.write(
+                                (
+                                    f"[feature_pipeline] feature_mask_fraction unavailable at step {global_step}; "
+                                    "skipping coverage check for this step."
+                                )
+                            )
+                            feature_mask_fraction_missing_warned = True
+                    else:
+                        feature_mask_fraction_missing_warned = False
+                        feature_mask_fraction_value = effective_mask_fraction
+                        if feature_mask_fraction_value < required_fraction:
+                            raise RuntimeError(
+                                f"feature mask fraction {feature_mask_fraction_value:.4f} below required {required_fraction:.2f} at step {global_step}"
+                            )
                     expected_src_dim = int(feature_cfg.projector_input_dim)
                     if feature_src_dim_value is not None and feature_src_dim_value != expected_src_dim:
                         raise RuntimeError(
