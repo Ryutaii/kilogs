@@ -46,6 +46,7 @@ kilogs/
    python distill/lego_response_distill.py --config configs/lego_response.yaml
    ```
    デフォルトでは教師レンダリングと一致するカメラポーズをサンプリングし、RGB + 透過率の L2 損失で学生を更新します。
+   - TensorBoard のログはステップ軸で記録されます。実時間ベースで見たい場合は各設定ファイルの `logging.tensorboard_axis` を `time` に変更してください（`step` と `elapsed` も選択可）。
 
 5. **評価**
    - `results/lego/` に保存されたチェックポイントを用いて、KiloNeRF 推論スクリプトでレンダリングし、`3dgs/tools/export_metrics_csv.py` を再利用して PSNR/SSIM/LPIPS を記録。

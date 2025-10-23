@@ -103,6 +103,14 @@ def _validate_student(section: Mapping[str, Any]) -> None:
         "hash_log2_hashmap_size",
         "hash_base_resolution",
         "hash_per_level_scale",
+        "pos_encoding",
+        "pos_L",
+        "dir_encoding",
+        "dir_L",
+        "skips",
+        "mlp_hidden",
+        "sigma_activation",
+        "sigma_bias",
     }
     _check_unknown_keys(section, allowed, "student")
     if "type" not in section:
@@ -186,7 +194,7 @@ def _validate_loss(section: Mapping[str, Any]) -> None:
         if key not in section:
             raise ValueError(f"'loss.{key}' is required")
     color = _ensure_mapping(section["color"], "loss.color")
-    _check_unknown_keys(color, {"type", "weight"}, "loss.color")
+    _check_unknown_keys(color, {"type", "weight", "eps", "epsilon"}, "loss.color")
     if "weight" in color:
         _ensure_float(color["weight"], "loss.color.weight")
     opacity_allowed = {
@@ -206,6 +214,7 @@ def _validate_loss(section: Mapping[str, Any]) -> None:
         "hysteresis",
         "enable_hysteresis",
         "warm_start_offset",
+        "max_weight",
     }
     opacity = _ensure_mapping(section["opacity"], "loss.opacity")
     _check_unknown_keys(opacity, opacity_allowed, "loss.opacity")
@@ -340,7 +349,15 @@ def _validate_feature_pipeline(section: Mapping[str, Any]) -> None:
 def _validate_logging(section: Mapping[str, Any]) -> None:
     _check_unknown_keys(
         section,
-        {"tensorboard", "csv", "render_preview_interval", "log_interval", "metrics_interval", "tensorboard_flush_secs"},
+        {
+            "tensorboard",
+            "csv",
+            "render_preview_interval",
+            "log_interval",
+            "metrics_interval",
+            "tensorboard_flush_secs",
+            "tensorboard_axis",
+        },
         "logging",
     )
     for key in ("tensorboard", "csv"):
@@ -352,6 +369,13 @@ def _validate_logging(section: Mapping[str, Any]) -> None:
         _ensure_int(section["metrics_interval"], "logging.metrics_interval", min_value=1)
     if "tensorboard_flush_secs" in section:
         _ensure_int(section["tensorboard_flush_secs"], "logging.tensorboard_flush_secs", min_value=1)
+    axis_mode = section.get("tensorboard_axis")
+    if axis_mode is not None:
+        if not isinstance(axis_mode, str):
+            raise ValueError("logging.tensorboard_axis must be a string if provided")
+        axis_mode_normalized = axis_mode.strip().lower()
+        if axis_mode_normalized not in {"time", "step", "elapsed"}:
+            raise ValueError("logging.tensorboard_axis must be one of {'time', 'step', 'elapsed'}")
 
 
 def _validate_feature_targets(section: Mapping[str, Any]) -> None:

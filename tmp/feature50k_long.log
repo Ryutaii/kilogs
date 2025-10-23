@@ -1,0 +1,16 @@
+[debug] importing lego_response_distill from /mnt/d/imaizumi/kilogs/distill/lego_response_distill.py
+[logging] TensorBoard writer initialised → logs/lego/feat_t_full/runs/student_rgb_fourier_dir_depth030_alpha075_feature50k/tensorboard
+[seed] Aligning PYTHONHASHSEED to 2025 (previously unset).
+[seed] CUBLAS_WORKSPACE_CONFIG unset; forcing ':4096:8' for deterministic cuBLAS kernels.
+[seed] PYTHONHASHSEED aligned to 2025.
+[dataset] Loaded teacher supervision frames: 200 @ 800x800, has_depth=True
+[signal] Ctrl+C detected. Press again to confirm interruption (first signal ignored).
+
+CondaError: KeyboardInterrupt
+
+[feature_pipeline] loaded gaussian teacher features with dimension 52
+[feature_pipeline] comparison feature dim=52, projector in/out=(64->52)
+[feature_pipeline] student-space policy bypassed for compare_space='teacher'
+[phase] Loaded schedule: student_rgb_feature:1-50000
+[resume] Loaded checkpoint 'results/lego/feat_t_full/runs/student_rgb_fourier_dir_depth030_alpha075_feature50k/checkpoints/step_006600.pth' at step 6600
+[gate] promotion_gates unspecified; defaulting to (10000, 20000, 50000)

@@ -1,0 +1,22 @@
+[debug] importing lego_response_distill from /mnt/d/imaizumi/kilogs/distill/lego_response_distill.py
+[config] max_steps override 10000 is below config max_steps 50000; using override regardless.
+[config] Overriding train.max_steps 50000 -> 10000
+[logging] TensorBoard writer initialised → logs/lego/feat_t_full/runs/teacher_full_rehab_masked_white/tensorboard
+[seed] CUBLAS_WORKSPACE_CONFIG unset; forcing ':4096:8' for deterministic cuBLAS kernels.
+[seed] PYTHONHASHSEED aligned to 2025.
+[dataset] Loaded teacher supervision frames: 200 @ 800x800, has_depth=True
+[feature_pipeline] loaded gaussian teacher features with dimension 52
+[feature_pipeline] comparison feature dim=52, projector in/out=(128->52)
+[feature_pipeline] student-space policy bypassed for compare_space='teacher'
+[phase] Loaded schedule: projector_warmup:1-2000, joint_training:2001-50000
+[gate] Dropped promotion gates beyond max_steps=10000: (20000, 50000)
+[phase] Projector-only warmup forcing feature loss on.
+[phase] Enter projector_warmup [1-2000] optimize=['projector'] mask_override=inherit feature_scale=1.000
+[init] Entering first KiloNeRF forward pass (may take several minutes).
+[init] First KiloNeRF forward pass finished; continuing with training loop.
+[phase] Projector-only warmup feature loss restored to config values.
+[phase] Enter joint_training [2001-50000] optimize=['projector', 'student'] mask_override=inherit feature_scale=1.000
+[feature_pipeline] Mask prefail trigger: p5_rate=nan, min_rate=nan, threshold=0.2400
+[gate] Promotion gate passed at step 10000 (mask=0.525, feature_dim=128, projector_dim=52, feature_scale=1.000, feature_ratio=1.00, opacity_ratio=1.00, feature_sched=Y, opacity_sched=Y)
+Saved checkpoint to results/lego/feat_t_full/runs/teacher_full_rehab_masked_white/checkpoints/step_010000.pth
+Final checkpoint saved to results/lego/feat_t_full/runs/teacher_full_rehab_masked_white/checkpoints/step_010000.pth

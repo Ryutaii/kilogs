@@ -85,7 +85,13 @@ def render_valid_rays(
 
 
 @torch.no_grad()
-def evaluate(config_path: Path, checkpoint_path: Path, output_csv: Path | None = None) -> Dict[str, float]:
+def evaluate(
+    config_path: Path,
+    checkpoint_path: Path,
+    output_csv: Path | None = None,
+    *,
+    allow_mismatched_weights: bool = False,
+) -> Dict[str, float]:
     (
         experiment_cfg,
         data_cfg,
@@ -105,7 +111,25 @@ def evaluate(config_path: Path, checkpoint_path: Path, output_csv: Path | None =
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = StudentModel(student_cfg).to(device)
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(checkpoint["model_state"])
+    model_state = checkpoint["model_state"]
+    if allow_mismatched_weights:
+        # 部分ロード: 形状一致するパラメータのみ適用して評価を継続
+        current_state = model.state_dict()
+        compatible: Dict[str, torch.Tensor] = {}
+        missed: List[str] = []
+        for k, v in model_state.items():
+            if k in current_state and current_state[k].shape == v.shape:
+                compatible[k] = v
+            else:
+                missed.append(k)
+        model.load_state_dict(compatible, strict=False)
+        if missed:
+            print(
+                f"[warning] skipped {len(missed)} parameters due to shape mismatch (e.g. {missed[:3]})",
+                flush=True,
+            )
+    else:
+        model.load_state_dict(model_state)
     model.eval()
 
     background = dataset.background.to(device)
@@ -187,9 +211,19 @@ def main() -> None:
     parser.add_argument("--config", type=Path, required=True, help="Path to the training config YAML")
     parser.add_argument("--checkpoint", type=Path, required=True, help="Checkpoint path to evaluate")
     parser.add_argument("--out", type=Path, help="Optional CSV output path")
+    parser.add_argument(
+        "--allow-mismatched-weights",
+        action="store_true",
+        help="Allow partial checkpoint loading when shapes differ (e.g., grid resolution mismatch)",
+    )
     args = parser.parse_args()
 
-    metrics = evaluate(args.config, args.checkpoint, args.out)
+    metrics = evaluate(
+        args.config,
+        args.checkpoint,
+        args.out,
+        allow_mismatched_weights=bool(args.allow_mismatched_weights),
+    )
     print(f"Average PSNR: {metrics['avg_psnr']:.4f} dB")
     print(f"Average MSE: {metrics['avg_mse']:.8f}")
     print(f"Per-view metrics saved to: {metrics['csv']}")

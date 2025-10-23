@@ -1,8 +1,8 @@
 experiment:
-  name: lego_feature_teacher_full_rehab_masked_white
+  name: lego_feature_teacher_full_quickwin_relaxed_alpha045_recover_v2_stage2_tbdebug
   seed: 2025
-  output_dir: results/lego/feat_t_full/runs/teacher_full_rehab_masked_white
-  progress_desc: 特徴蒸留_教師52d
+  output_dir: results/lego/feat_t_full/runs/teacher_full_quickwin_relaxed_alpha045_recover_v2_tbdebug
+  progress_desc: 特徴蒸留_教師52d(stage2)_tbdebug
 
 data:
   dataset_root: ../3dgs/data/nerf_synthetic/lego
@@ -25,12 +25,12 @@ teacher:
   render_stats: teacher/outputs/lego/test_white/ours_30000/render_stats.json
 
 student:
-  type: kilo_uniform_mlp
-  grid_resolution: [2, 18, 10]
+  type: simple_mlp
+  grid_resolution: [6, 6, 6]
   hidden_dim: 128
   num_layers: 4
   activation: relu
-  density_bias: 0.0
+  density_bias: -1.0
   color_bias: 0.0
   regularization_weight: 1e-4
   enable_boundary_blend: true
@@ -76,13 +76,13 @@ loss:
     weight: 0.3
     alpha_threshold: 0.6
   feature_l2:
-    weight: 0.05
+    weight: 0.0
     warmup:
       steps: 4000
       type: linear
       start_weight: 0.0
   feature_cos:
-    weight: 0.01
+    weight: 0.0
     warmup:
       steps: 4000
       type: linear
@@ -93,7 +93,7 @@ feature_targets:
   cos_target: 0.01
 
 feature_pipeline:
-  enabled: true
+  enabled: false
   teacher_mode: gaussian_sh_opacity_logscale
   compare_space: teacher
   projector:
@@ -107,9 +107,11 @@ feature_pipeline:
   mask_controller: null
 
 logging:
-  tensorboard: logs/lego/feat_t_full/runs/teacher_full_rehab_masked_white/tensorboard
-  csv: logs/lego/feat_t_full/runs/teacher_full_rehab_masked_white/training_metrics.csv
+  tensorboard: logs/lego/feat_t_full/runs/teacher_full_quickwin_relaxed_alpha045_recover_v2_tbdebug/tensorboard
+  csv: logs/lego/feat_t_full/runs/teacher_full_quickwin_relaxed_alpha045_recover_v2_tbdebug/training_metrics.csv
   render_preview_interval: 10000
+  log_interval: 50
+  tensorboard_flush_secs: 15
 
 dataset: {frames: 200, size: 800}
 background: masked_white

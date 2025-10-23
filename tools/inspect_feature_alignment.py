@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import torch
+import torch.nn.functional as F
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -168,8 +169,14 @@ def inspect_alignment(
         pts_norm = (pts - bbox_min) / bbox_extent
         pts_norm = pts_norm.clamp(0.0, 1.0)
         pts_flat = pts_norm.view(-1, 3)
+        ray_dirs = F.normalize(rays_d, dim=-1, eps=1e-6)
+        ray_dirs_flat = (
+            ray_dirs[:, None, :]
+            .expand(-1, data_cfg.samples_per_ray, -1)
+            .reshape(-1, 3)
+        )
 
-        student_rgb_samples, student_sigma_samples = student_model(pts_flat)
+        student_rgb_samples, student_sigma_samples = student_model(pts_flat, ray_dirs_flat)
         student_rgb_samples = student_rgb_samples.view(-1, data_cfg.samples_per_ray, 3)
         student_sigma_samples = student_sigma_samples.view(-1, data_cfg.samples_per_ray)
 

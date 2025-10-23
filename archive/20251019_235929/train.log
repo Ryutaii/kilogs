@@ -1,0 +1,40 @@
+[debug] importing lego_response_distill from /mnt/d/imaizumi/kilogs/distill/lego_response_distill.py
+[config] max_steps override 10000 is below config max_steps 50000; using override regardless.
+[config] Overriding train.max_steps 50000 -> 10000
+[logging] TensorBoard writer initialised → logs/lego/feat_t_full/runs/teacher_full_rehab_masked_white/tensorboard
+/mnt/d/imaizumi/kilogs/distill/lego_response_distill.py:2034: TracerWarning: Converting a tensor to a Python boolean might cause the trace to be incorrect. We can't record the data flow of Python values, so this value will be treated as a constant in the future. This means that the trace might not generalize to other inputs!
+  if x.ndim != 2 or x.shape[-1] != 3:
+/mnt/d/imaizumi/kilogs/distill/lego_response_distill.py:2037: TracerWarning: Converting a tensor to a Python boolean might cause the trace to be incorrect. We can't record the data flow of Python values, so this value will be treated as a constant in the future. This means that the trace might not generalize to other inputs!
+  if x.numel() == 0:
+/mnt/d/imaizumi/kilogs/distill/lego_response_distill.py:1988: TracerWarning: Converting a tensor to a Python boolean might cause the trace to be incorrect. We can't record the data flow of Python values, so this value will be treated as a constant in the future. This means that the trace might not generalize to other inputs!
+  if lin_idx.numel() == 0:
+/mnt/d/imaizumi/kilogs/distill/lego_response_distill.py:2003: TracerWarning: Converting a tensor to a Python boolean might cause the trace to be incorrect. We can't record the data flow of Python values, so this value will be treated as a constant in the future. This means that the trace might not generalize to other inputs!
+  if lin_sorted.numel() > 0:
+/mnt/d/imaizumi/kilogs/distill/lego_response_distill.py:2143: TracerWarning: Converting a tensor to a Python boolean might cause the trace to be incorrect. We can't record the data flow of Python values, so this value will be treated as a constant in the future. This means that the trace might not generalize to other inputs!
+  if torch.any(lower_x):
+/mnt/d/imaizumi/kilogs/distill/lego_response_distill.py:2084: TracerWarning: Converting a tensor to a Python boolean might cause the trace to be incorrect. We can't record the data flow of Python values, so this value will be treated as a constant in the future. This means that the trace might not generalize to other inputs!
+  if mask_tensor is None or mask_tensor.numel() == 0:
+/mnt/d/imaizumi/kilogs/distill/lego_response_distill.py:2087: TracerWarning: Converting a tensor to a Python boolean might cause the trace to be incorrect. We can't record the data flow of Python values, so this value will be treated as a constant in the future. This means that the trace might not generalize to other inputs!
+  if sample_idx.numel() == 0:
+/mnt/d/imaizumi/kilogs/distill/lego_response_distill.py:2097: TracerWarning: Converting a tensor to a Python boolean might cause the trace to be incorrect. We can't record the data flow of Python values, so this value will be treated as a constant in the future. This means that the trace might not generalize to other inputs!
+  if not torch.any(valid):
+/mnt/d/imaizumi/kilogs/distill/lego_response_distill.py:2146: TracerWarning: Converting a tensor to a Python boolean might cause the trace to be incorrect. We can't record the data flow of Python values, so this value will be treated as a constant in the future. This means that the trace might not generalize to other inputs!
+  if torch.any(upper_x):
+/mnt/d/imaizumi/kilogs/distill/lego_response_distill.py:2149: TracerWarning: Converting a tensor to a Python boolean might cause the trace to be incorrect. We can't record the data flow of Python values, so this value will be treated as a constant in the future. This means that the trace might not generalize to other inputs!
+  if torch.any(lower_y):
+/mnt/d/imaizumi/kilogs/distill/lego_response_distill.py:2101: TracerWarning: Converting a tensor to a Python boolean might cause the trace to be incorrect. We can't record the data flow of Python values, so this value will be treated as a constant in the future. This means that the trace might not generalize to other inputs!
+  if sample_idx.numel() == 0:
+/mnt/d/imaizumi/kilogs/distill/lego_response_distill.py:2152: TracerWarning: Converting a tensor to a Python boolean might cause the trace to be incorrect. We can't record the data flow of Python values, so this value will be treated as a constant in the future. This means that the trace might not generalize to other inputs!
+  if torch.any(upper_y):
+/mnt/d/imaizumi/kilogs/distill/lego_response_distill.py:2155: TracerWarning: Converting a tensor to a Python boolean might cause the trace to be incorrect. We can't record the data flow of Python values, so this value will be treated as a constant in the future. This means that the trace might not generalize to other inputs!
+  if torch.any(lower_z):
+/mnt/d/imaizumi/kilogs/distill/lego_response_distill.py:2158: TracerWarning: Converting a tensor to a Python boolean might cause the trace to be incorrect. We can't record the data flow of Python values, so this value will be treated as a constant in the future. This means that the trace might not generalize to other inputs!
+  if torch.any(upper_z):
+[seed] CUBLAS_WORKSPACE_CONFIG unset; forcing ':4096:8' for deterministic cuBLAS kernels.
+[seed] PYTHONHASHSEED aligned to 2025.
+[dataset] Loaded teacher supervision frames: 200 @ 800x800, has_depth=True
+[feature_pipeline] loaded gaussian teacher features with dimension 52
+[feature_pipeline] comparison feature dim=52, projector in/out=(128->52)
+[feature_pipeline] student-space policy bypassed for compare_space='teacher'
+[phase] Loaded schedule: projector_warmup:1-2000, joint_training:2001-50000
+[gate] Dropped promotion gates beyond max_steps=10000: (20000, 50000)

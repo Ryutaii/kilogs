@@ -1,0 +1,99 @@
+experiment:
+  name: tb_axis_cli
+  seed: 2025
+  output_dir: results/tmp/tb_axis_cli
+  progress_desc: tensorboard_axis_debug
+data:
+  dataset_root: ../3dgs/data/nerf_synthetic/lego
+  teacher_outputs: teacher/outputs/lego/test_white/ours_30000
+  teacher_depth_dir: teacher/outputs/lego/test_white/ours_30000/depth
+  camera_json: teacher/outputs/lego/test_white/ours_30000/transforms_test_white.json
+  background_color:
+  - 1.0
+  - 1.0
+  - 1.0
+  batch_size: 2048
+  ray_chunk: 256
+  near: 2.0
+  far: 6.0
+  samples_per_ray: 64
+  bbox_min:
+  - -1.5
+  - -1.5
+  - -1.5
+  bbox_max:
+  - 1.5
+  - 1.5
+  - 1.5
+  perturb: true
+teacher:
+  type: gaussian_splatting
+  checkpoint: teacher/checkpoints/lego/point_cloud/iteration_30000/point_cloud.ply
+  render_stats: teacher/outputs/lego/test_white/ours_30000/render_stats.json
+student:
+  type: simple_mlp
+  grid_resolution:
+  - 6
+  - 6
+  - 6
+  hidden_dim: 64
+  num_layers: 3
+  activation: relu
+  density_bias: -1.0
+  color_bias: 0.0
+  regularization_weight: 1e-4
+  enable_boundary_blend: false
+train:
+  max_steps: 800
+  phases:
+  - name: warmup
+    end_step: 200
+    optimize:
+    - student
+    freeze_student: false
+    phase_feature_scale: 1.0
+  eval_interval: 400
+  checkpoint_interval: 400
+  lr: 1e-3
+  lr_schedule: cosine
+  lr_schedule_steps: 800
+  gradient_clip_norm: 1.0
+  ema_decay: 0.0
+loss:
+  color:
+    type: l2
+    weight: 1.0
+  opacity:
+    type: l1
+    weight: 0.0
+    target: 0.05
+    target_weight: 0.05
+    warmup_steps: 0
+  depth:
+    type: smooth_l1
+    weight: 0.0
+    alpha_threshold: 0.6
+  feature_l2:
+    weight: 0.0
+  feature_cos:
+    weight: 0.0
+feature_targets:
+  l2_target: 0.0
+  cos_target: 0.0
+feature_pipeline:
+  enabled: false
+  teacher_mode: rgb
+  compare_space: teacher
+  projector:
+    in_dim: 16
+    out_dim: 16
+logging:
+  tensorboard: logs/tmp/tb_axis_cli/tensorboard
+  csv: logs/tmp/tb_axis_cli/training_metrics.csv
+  render_preview_interval: 1000
+  log_interval: 1
+  tensorboard_axis: elapsed
+dataset:
+  frames: 16
+  size: 400
+background: masked_white

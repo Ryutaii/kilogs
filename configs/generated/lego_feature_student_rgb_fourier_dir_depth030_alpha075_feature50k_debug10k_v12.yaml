@@ -1,8 +1,8 @@
 experiment:
-  name: lego_feature_teacher_full_student_space_kilonerf_grid
+  name: feature_distill_v12_debug10k
   seed: 2025
-  output_dir: results/lego/feat_t_full/runs/student_space_kilonerf_grid
-  progress_desc: 特徴蒸留_student空間_kilonerf
+  output_dir: results/lego/feat_t_full/runs/feature_distill_v12_debug10k
+  progress_desc: 特徴蒸留v12
 
 data:
   dataset_root: ../3dgs/data/nerf_synthetic/lego
@@ -27,54 +27,60 @@ teacher:
 student:
   type: kilo_uniform_mlp
   grid_resolution: [2, 18, 10]
-  hidden_dim: 128
-  num_layers: 4
+  hidden_dim: 64
+  num_layers: 2
   activation: relu
+  pos_encoding: fourier
+  pos_L: 10
+  dir_encoding: fourier
+  dir_L: 4
+  skips: [2]
   density_bias: -1.0
+  sigma_bias: -1.2
+  sigma_activation: shifted_softplus
   color_bias: 0.0
   regularization_weight: 1e-4
   enable_boundary_blend: true
   boundary_blend_margin: 0.08
 
 train:
-  max_steps: 50000
+  max_steps: 10000
   phases:
-    - name: projector_warmup
-      end_step: 2000
-      optimize: [projector, teacher_adapter]
-      freeze_student: true
-      phase_feature_scale: 0.5
-      force_feature_on: true
-    - name: joint_training
-      end_step: 50000
-      optimize: [student, projector, teacher_adapter]
+    - name: student_rgb_feature
+      end_step: 10000
+      optimize: [student]
       freeze_student: false
       phase_feature_scale: 1.0
-  eval_interval: 10000
-  checkpoint_interval: 10000
+  eval_interval: 2000
+  checkpoint_interval: 5000
   lr: 5e-4
   lr_schedule: cosine
-  lr_schedule_steps: 50000
+  lr_schedule_steps: 10000
   gradient_clip_norm: 1.0
   ema_decay: 0.999
+  lr_warmup_steps: 1000
+  promotion_gates: false
 
 loss:
   color:
-    type: l2
+    type: charbonnier
     weight: 1.0
+    eps: 1.0e-3
   opacity:
     type: l1
-    weight: 0.25
-    target: 0.05
-    target_weight: 0.35
-    warmup_steps: 2000
+    weight: 0.035
+    target: 0.035
+    target_weight: 0.08
+    start_weight: 0.035
+    warmup_steps: 1200
     schedule: cosine
-    schedule_duration: 6000
+    schedule_duration: 5000
     background_threshold: 0.05
+    max_weight: 0.12
   depth:
     type: smooth_l1
-    weight: 0.3
-    alpha_threshold: 0.6
+    weight: 0.03
+    alpha_threshold: 0.7
   feature_l2:
     weight: 0.05
     warmup:
@@ -87,6 +93,21 @@ loss:
       steps: 4000
       type: linear
       start_weight: 0.0
+  alpha_guard:
+    enabled: true
+    initial_weight: 0.08
+    weight_floor: 0.03
+    weight_cap: 0.18
+    penalty_hi: 0.25
+    penalty_lo: 0.02
+    relax_rate: 1.01
+    tighten_rate: 0.98
+    fraction_hi_weight: 1.0
+    fraction_lo_weight: 1.0
+    band_weight: 1.0
+    adjustment_smoothing: 0.15
+    check_interval: 300
+    min_target_weight: 0.03
 
 feature_targets:
   l2_target: 0.05
@@ -95,30 +116,25 @@ feature_targets:
 feature_pipeline:
   enabled: true
   teacher_mode: gaussian_sh_opacity_logscale
-  compare_space: student
+  compare_space: teacher
   allow_dim_mismatch: true
   projector:
-    in_dim: 128
+    in_dim: 64
     hidden_dim: 128
-    out_dim: 128
-    use_layer_norm: true
+    out_dim: 52
     activation: relu
+    use_layer_norm: true
     dropout: 0.0
-  teacher_adapter:
-    type: linear
-    activation: relu
-    use_layer_norm: true
-    output_dim: 128
-  student_adapter: null
+  teacher_adapter: null
   boundary_mask_threshold: 0.60
   boundary_mask_soft_transition: 0.10
   mask_controller: null
 
 logging:
-  tensorboard: logs/lego/feat_t_full/runs/student_space_kilonerf_grid/tensorboard
-  csv: logs/lego/feat_t_full/runs/student_space_kilonerf_grid/training_metrics.csv
-  log_interval: 50
-  render_preview_interval: 10000
+  tensorboard: logs/lego/feat_t_full/runs/feature_distill_v12_debug10k/tensorboard
+  csv: logs/lego/feat_t_full/runs/feature_distill_v12_debug10k/training_metrics.csv
+  render_preview_interval: 5000
+  log_interval: 20
+  tensorboard_flush_secs: 10
 
-dataset: {frames: 200, size: 800}
 background: masked_white

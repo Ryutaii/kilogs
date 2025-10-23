@@ -1,0 +1,19 @@
+[debug] importing lego_response_distill from /mnt/d/imaizumi/kilogs/distill/lego_response_distill.py
+[config] max_steps override 6600 is below config max_steps 50000; using override regardless.
+[config] Overriding train.max_steps 50000 -> 6600
+[logging] TensorBoard writer initialised → logs/lego/feat_t_full/runs/student_rgb_fourier_dir_depth030_alpha075_feature50k/tensorboard
+[seed] Aligning PYTHONHASHSEED to 2025 (previously unset).
+[seed] CUBLAS_WORKSPACE_CONFIG unset; forcing ':4096:8' for deterministic cuBLAS kernels.
+[seed] PYTHONHASHSEED aligned to 2025.
+[dataset] Loaded teacher supervision frames: 200 @ 800x800, has_depth=True
+[feature_pipeline] loaded gaussian teacher features with dimension 52
+[feature_pipeline] comparison feature dim=52, projector in/out=(64->52)
+[feature_pipeline] student-space policy bypassed for compare_space='teacher'
+[phase] Loaded schedule: student_rgb_feature:1-50000
+[resume] Loaded checkpoint 'results/lego/feat_t_full/runs/student_rgb_fourier_dir_depth030_alpha075_feature50k/checkpoints/step_005000.pth' at step 5000
+[phase] Enter student_rgb_feature [1-50000] optimize=['student'] mask_override=inherit feature_scale=1.000
+[debug_start] start_step=5000
+[init] Entering first KiloNeRF forward pass (may take several minutes).
+[init] First KiloNeRF forward pass finished; continuing with training loop.
+[feature_pipeline] feature_mask_fraction unavailable at step 6500; skipping coverage check for this step.
+Final checkpoint saved to results/lego/feat_t_full/runs/student_rgb_fourier_dir_depth030_alpha075_feature50k/checkpoints/step_006600.pth

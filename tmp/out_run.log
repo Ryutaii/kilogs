@@ -1,0 +1,6 @@
+[debug] importing lego_response_distill from /mnt/d/imaizumi/kilogs/distill/lego_response_distill.py
+[config] max_steps override 4 is below config max_steps 20; using override regardless.
+[config] Overriding train.max_steps 20 -> 4
+[logging] TensorBoard writer initialised → tmp/tb_scalar_debug/logs/tensorboard
+[seed] PYTHONHASHSEED is unset; expected 1234 for reproducibility. Export PYTHONHASHSEED before launching.
+[seed] CUBLAS_WORKSPACE_CONFIG unset; forcing ':4096:8' for deterministic cuBLAS kernels.

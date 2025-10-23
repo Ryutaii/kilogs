@@ -1,0 +1,113 @@
+experiment:
+  name: lego_feature_student_rgb_fourier_dir_depth030_alpha075
+  seed: 2025
+  output_dir: results/lego/feat_t_full/runs/student_rgb_fourier_dir_depth030_alpha075
+  progress_desc: RGB Fourier student view-dependent 10k (depth 0.03, softer alpha)
+
+data:
+  dataset_root: ../3dgs/data/nerf_synthetic/lego
+  teacher_outputs: teacher/outputs/lego/test_white/ours_30000
+  teacher_depth_dir: teacher/outputs/lego/test_white/ours_30000/depth
+  camera_json: teacher/outputs/lego/test_white/ours_30000/transforms_test_white.json
+  background_color: [1.0, 1.0, 1.0]
+  batch_size: 8192
+  ray_chunk: 1024
+  near: 2.0
+  far: 6.0
+  samples_per_ray: 128
+  bbox_min: [-1.5, -1.5, -1.5]
+  bbox_max: [1.5, 1.5, 1.5]
+  perturb: true
+
+teacher:
+  type: gaussian_splatting
+  checkpoint: teacher/checkpoints/lego/point_cloud/iteration_30000/point_cloud.ply
+  render_stats: teacher/outputs/lego/test_white/ours_30000/render_stats.json
+
+student:
+  type: kilo_uniform_mlp
+  grid_resolution: [2, 18, 10]
+  hidden_dim: 64
+  num_layers: 2
+  activation: relu
+  pos_encoding: fourier
+  pos_L: 10
+  dir_encoding: fourier
+  dir_L: 4
+  skips: [2]
+  density_bias: -1.0
+  sigma_bias: -1.2
+  sigma_activation: shifted_softplus
+  color_bias: 0.0
+  regularization_weight: 1e-4
+  enable_boundary_blend: true
+  boundary_blend_margin: 0.08
+
+train:
+  max_steps: 10000
+  phases:
+    - name: student_rgb_only
+      end_step: 10000
+      optimize: [student]
+      freeze_student: false
+      phase_feature_scale: 0.0
+  eval_interval: 2000
+  checkpoint_interval: 5000
+  lr: 5e-4
+  lr_schedule: cosine
+  lr_schedule_steps: 10000
+  gradient_clip_norm: 1.0
+  ema_decay: 0.999
+  lr_warmup_steps: 500
+  promotion_gates: false
+
+loss:
+  color:
+    type: charbonnier
+    weight: 1.0
+    eps: 1.0e-3
+  opacity:
+    type: l1
+    weight: 0.035
+    target: 0.035
+    target_weight: 0.08
+    start_weight: 0.035
+    warmup_steps: 2000
+    schedule: cosine
+    schedule_duration: 7000
+    background_threshold: 0.05
+    max_weight: 0.12
+  depth:
+    type: smooth_l1
+    weight: 0.03
+    alpha_threshold: 0.7
+  feature_l2:
+    weight: 0.0
+  feature_cos:
+    weight: 0.0
+  alpha_guard:
+    enabled: true
+    initial_weight: 0.08
+    weight_floor: 0.03
+    weight_cap: 0.18
+    penalty_hi: 0.25
+    penalty_lo: 0.02
+    relax_rate: 1.01
+    tighten_rate: 0.98
+    fraction_hi_weight: 1.0
+    fraction_lo_weight: 1.0
+    band_weight: 1.0
+    adjustment_smoothing: 0.25
+    check_interval: 300
+
+feature_pipeline:
+  enabled: false
+
+logging:
+  tensorboard: logs/lego/feat_t_full/runs/student_rgb_fourier_dir_depth030_alpha075/tensorboard
+  csv: logs/lego/feat_t_full/runs/student_rgb_fourier_dir_depth030_alpha075/training_metrics.csv
+  render_preview_interval: 2000
+  log_interval: 20
+  tensorboard_flush_secs: 10
+
+background: masked_white

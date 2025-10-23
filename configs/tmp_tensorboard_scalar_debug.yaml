@@ -1,0 +1,103 @@
+experiment:
+  name: tb_scalar_debug
+  seed: 1234
+  output_dir: tmp/tb_scalar_debug/run
+  progress_desc: TB Scalar Debug
+
+data:
+  dataset_root: tmp/dummy_dataset
+  teacher_outputs: tmp/dummy_dataset/teacher_outputs
+  camera_json: tmp/dummy_dataset/transforms.json
+  background_color: [0.0, 0.0, 0.0]
+  batch_size: 64
+  ray_chunk: 16
+  near: 2.0
+  far: 6.0
+  samples_per_ray: 8
+  bbox_min: [-1.0, -1.0, -1.0]
+  bbox_max: [1.0, 1.0, 1.0]
+  perturb: false
+
+teacher:
+  type: dummy
+  checkpoint: README.md
+  render_stats: README.md
+
+student:
+  type: simple_mlp
+  grid_resolution: [2, 2, 2]
+  hidden_dim: 64
+  num_layers: 2
+  activation: relu
+  density_bias: -1.0
+  color_bias: 0.0
+  regularization_weight: 1.0e-4
+  enable_boundary_blend: false
+  boundary_blend_margin: 0.0
+
+train:
+  max_steps: 20
+  phases:
+    - name: main
+      end_step: 20
+      optimize: [student]
+      freeze_student: false
+      phase_feature_scale: 1.0
+  promotion_gates: []
+  eval_interval: 10
+  checkpoint_interval: 10
+  lr: 5.0e-4
+  lr_schedule: none
+  lr_schedule_steps: 0
+  gradient_clip_norm: 1.0
+  ema_decay: 0.0
+
+loss:
+  color:
+    type: l2
+    weight: 1.0
+  opacity:
+    type: l1
+    weight: 0.0
+    target: 0.0
+    target_weight: 0.0
+    warmup_steps: 0
+    schedule: none
+    schedule_duration: 0
+    background_threshold: 0.0
+  depth:
+    type: l1
+    weight: 0.0
+    alpha_threshold: 0.0
+  feature_l2:
+    weight: 0.0
+  feature_cos:
+    weight: 0.0
+
+feature_targets:
+  l2_target: 0.0
+  cos_target: 0.0
+
+feature_pipeline:
+  enabled: false
+  teacher_mode: rgb
+  compare_space: student
+  projector:
+    in_dim: 3
+    out_dim: 3
+  teacher_adapter: null
+  student_adapter: null
+  allow_dim_mismatch: false
+  boundary_mask_threshold: 0.0
+  boundary_mask_soft_transition: 0.0
+  mask_controller: null
+
+logging:
+  tensorboard: tmp/tb_scalar_debug/logs/tensorboard
+  csv: tmp/tb_scalar_debug/logs/training_metrics.csv
+  log_interval: 1
+  render_preview_interval: 100
+  tensorboard_flush_secs: 1
+
+dataset: {frames: 1, size: 8}
+background: black
