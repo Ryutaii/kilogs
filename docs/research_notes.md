@@ -70,6 +70,9 @@ Stable, reproducible pipeline for rendering & evaluating student vs teacher on *
 
 * 進捗バーの表示名が `(特徴蒸留v11)` となり、メトリクス確認が簡潔化。次回 v12 へ更新する際は `experiment.name`, `output_dir`, `progress_desc` の末尾を揃えてバージョンを increment する。
 * `logs/.../training_metrics.csv` の初期行から希望のスカラーが並ぶことを確認済み（Step 1〜20）。TensorBoard 側も絞ったスカラーだけが表示され、ノイズが減少。
+* `training_metrics.csv`（step 1〜3288）を確認したところ、`opacity_target_weight_base` が 0.035→0.038 付近で緩やかに推移する一方、`opacity_target_weight_effective` は `alpha_guard.min_target_weight` の既定値 0.05 によって常時クランプされていることが判明。`opacity_target_adjustment` も 1.10 付近まで上昇しており、ガードが緩め方向へ動こうとしているのに実効重みが追従できない状態。
+* feature loss の重みは 4k step でウォームアップが終わった時点から `feature_l2=0.05`, `feature_cos=0.01` に固定される。色 loss が落ち着いてきた段階でさらに特徴寄りへ寄せられるよう、`feature_target_weight` / `feature_target_cosine_weight` を高めに設定し、`feature_schedule`（linear/cosine）と `feature_schedule_duration` を使って段階的に比率を上げる案を検討する。目安として 4k→12k step で 0.05→0.08, 0.01→0.02 程度まで引き上げるスケジュールを試すと収束バランスを調整しやすい。
+* 上記対処として `configs/generated/lego_feature_student_rgb_fourier_dir_depth030_alpha075_feature50k_debug10k_v12.yaml` を作成。`loss.opacity.warmup_steps=1200`, `schedule_duration=5000` へ短縮し、初期 3k step 台で 0.05 を超えるよう調整。さらに `loss.alpha_guard.min_target_weight=0.03`, `adjustment_smoothing=0.15` を追加してターゲット重みの追従性を上げる。`experiment.name=feature_distill_v12_debug10k` / `progress_desc=特徴蒸留v12` としてログ出力先も v12 用に分離。
 
 ---
 
