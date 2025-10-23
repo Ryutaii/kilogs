@@ -44,10 +44,10 @@ student:
   boundary_blend_margin: 0.08
 
 train:
-  max_steps: 10000
+  max_steps: 50000
   phases:
     - name: student_rgb_feature
-      end_step: 10000
+      end_step: 50000
       optimize: [student]
       freeze_student: false
       phase_feature_scale: 1.0
@@ -55,7 +55,7 @@ train:
   checkpoint_interval: 5000
   lr: 5e-4
   lr_schedule: cosine
-  lr_schedule_steps: 10000
+  lr_schedule_steps: 50000
   gradient_clip_norm: 1.0
   ema_decay: 0.999
   lr_warmup_steps: 1000
@@ -98,6 +98,7 @@ loss:
     initial_weight: 0.08
     weight_floor: 0.03
     weight_cap: 0.18
+    min_target_weight: 0.03
     penalty_hi: 0.25
     penalty_lo: 0.02
     relax_rate: 1.01
@@ -105,7 +106,7 @@ loss:
     fraction_hi_weight: 1.0
     fraction_lo_weight: 1.0
     band_weight: 1.0
-    adjustment_smoothing: 0.25
+    adjustment_smoothing: 0.15
     check_interval: 300
 
 feature_targets:
