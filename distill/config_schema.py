@@ -62,6 +62,8 @@ def _validate_data(section: Mapping[str, Any]) -> None:
         "bbox_min",
         "bbox_max",
         "perturb",
+        "max_frames",
+        "frame_indices",
     }
     _check_unknown_keys(section, allowed, "data")
     for required_key in ("dataset_root", "teacher_outputs", "camera_json", "background_color", "batch_size"):
@@ -77,6 +79,12 @@ def _validate_data(section: Mapping[str, Any]) -> None:
         raise ValueError("'data.background_color' must contain exactly 3 entries")
     for idx, value in enumerate(background):
         _ensure_float(value, f"data.background_color[{idx}]")
+    if "max_frames" in section and section["max_frames"] is not None:
+        _ensure_int(section["max_frames"], "data.max_frames", min_value=1)
+    if "frame_indices" in section and section["frame_indices"] is not None:
+        entries = _ensure_list(section["frame_indices"], "data.frame_indices")
+        for idx, value in enumerate(entries):
+            _ensure_int(value, f"data.frame_indices[{idx}]")
 
 
 def _validate_teacher(section: Mapping[str, Any]) -> None:
@@ -264,9 +272,34 @@ def _validate_loss(section: Mapping[str, Any]) -> None:
                 "warmup_enforce_steps",
                 "enforce_warmup_steps",
                 "adjustment_smoothing",
+                "hysteresis_margin",
+                "min_update_samples",
+                "max_lambda_delta",
+                "max_target_adjustment_delta",
+                "max_penalty_weight_delta",
             },
             "loss.alpha_guard",
         )
+        if "hysteresis_margin" in alpha_guard_map:
+            _ensure_float(alpha_guard_map["hysteresis_margin"], "loss.alpha_guard.hysteresis_margin")
+        if "min_update_samples" in alpha_guard_map:
+            _ensure_int(
+                alpha_guard_map["min_update_samples"],
+                "loss.alpha_guard.min_update_samples",
+                min_value=1,
+            )
+        if "max_lambda_delta" in alpha_guard_map:
+            _ensure_float(alpha_guard_map["max_lambda_delta"], "loss.alpha_guard.max_lambda_delta")
+        if "max_target_adjustment_delta" in alpha_guard_map:
+            _ensure_float(
+                alpha_guard_map["max_target_adjustment_delta"],
+                "loss.alpha_guard.max_target_adjustment_delta",
+            )
+        if "max_penalty_weight_delta" in alpha_guard_map:
+            _ensure_float(
+                alpha_guard_map["max_penalty_weight_delta"],
+                "loss.alpha_guard.max_penalty_weight_delta",
+            )
 
 
 def _validate_feature_pipeline(section: Mapping[str, Any]) -> None:

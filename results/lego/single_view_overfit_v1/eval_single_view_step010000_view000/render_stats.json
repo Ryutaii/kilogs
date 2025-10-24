@@ -1,0 +1,26 @@
+{
+  "num_frames": 1,
+  "total_render_time_s": 3.005128279000928,
+  "avg_fps": 0.33276449693936383,
+  "per_view_time_s": {
+    "renders/00000": 3.005128279000928
+  },
+  "start_frame": 0,
+  "chunk_size": 4096,
+  "num_samples": 128,
+  "near": 2.0,
+  "far": 6.0,
+  "bbox_min": [
+    -1.5,
+    -1.5,
+    -1.5
+  ],
+  "bbox_max": [
+    1.5,
+    1.5,
+    1.5
+  ],
+  "gpu_mem_peak_mib": 1295.240234375,
+  "gpu_mem_reserved_peak_mib": 1650.0,
+  "nvml_enabled": false
+}

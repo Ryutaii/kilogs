@@ -542,6 +542,8 @@ class DataConfig:
     bbox_min: Tuple[float, float, float]
     bbox_max: Tuple[float, float, float]
     perturb: bool
+    max_frames: Optional[int] = None
+    frame_indices: Tuple[int, ...] = tuple()
 
 
 @dataclass
@@ -611,6 +613,11 @@ class AlphaGuardConfig:
     min_target_weight: float = 0.05
     warmup_enforce_steps: int = 0
     adjustment_smoothing: float = 0.25
+    hysteresis_margin: float = 0.02
+    min_update_samples: int = 2
+    max_lambda_delta: float = 0.05
+    max_target_adjustment_delta: float = 0.1
+    max_penalty_weight_delta: float = 0.05
 
 
 @dataclass
@@ -1423,7 +1430,26 @@ class LegoRayDataset(Dataset):
         self.config = config
         with open(config.camera_json, "r", encoding="utf-8") as f:
             meta = json.load(f)
-        self.frames = meta["frames"]
+        frames: List[dict] = list(meta["frames"])
+        total_frames = len(frames)
+
+        if config.frame_indices:
+            selected: List[dict] = []
+            for candidate in config.frame_indices:
+                index = candidate
+                if index < 0:
+                    index = total_frames + index
+                if index < 0 or index >= total_frames:
+                    raise IndexError(
+                        f"Frame index {candidate} out of range for dataset with {total_frames} frames"
+                    )
+                selected.append(frames[index])
+            frames = selected
+
+        if config.max_frames is not None:
+            frames = frames[: config.max_frames]
+
+        self.frames = frames
         self.camera_angle_x = float(meta["camera_angle_x"])
         self.background = torch.tensor(config.background_color, dtype=torch.float32)
         self.near = float(config.near)
@@ -2406,6 +2432,27 @@ def parse_config(path: Path):
         progress_desc=experiment_section.get("progress_desc"),
     )
     data_section = raw["data"]
+    max_frames_raw = data_section.get("max_frames")
+    max_frames_value = None
+    if max_frames_raw is not None:
+        try:
+            max_frames_value = int(max_frames_raw)
+        except (TypeError, ValueError):
+            max_frames_value = None
+        if max_frames_value is not None and max_frames_value <= 0:
+            max_frames_value = None
+
+    frame_indices_raw = data_section.get("frame_indices")
+    frame_indices_tuple: Tuple[int, ...] = tuple()
+    if isinstance(frame_indices_raw, (list, tuple)):
+        parsed_indices: List[int] = []
+        for entry in frame_indices_raw:
+            try:
+                parsed = int(entry)
+            except (TypeError, ValueError):
+                continue
+            parsed_indices.append(parsed)
+        frame_indices_tuple = tuple(parsed_indices)
     data = DataConfig(
         dataset_root=Path(data_section["dataset_root"]),
         teacher_outputs=Path(data_section["teacher_outputs"]),
@@ -2420,6 +2467,8 @@ def parse_config(path: Path):
         bbox_min=tuple(float(v) for v in data_section.get("bbox_min", (-1.5, -1.5, -1.5))),
         bbox_max=tuple(float(v) for v in data_section.get("bbox_max", (1.5, 1.5, 1.5))),
         perturb=bool(data_section.get("perturb", True)),
+        max_frames=max_frames_value,
+        frame_indices=frame_indices_tuple,
     )
     teacher = TeacherConfig(
         type=raw["teacher"]["type"],
@@ -2698,6 +2747,57 @@ def parse_config(path: Path):
     except (TypeError, ValueError):
         alpha_guard_adjustment_smoothing = 0.25
 
+    hysteresis_margin_raw = alpha_guard_section.get("hysteresis_margin")
+    if hysteresis_margin_raw is None:
+        alpha_guard_hysteresis_margin = 0.02
+    else:
+        try:
+            alpha_guard_hysteresis_margin = float(hysteresis_margin_raw)
+        except (TypeError, ValueError):
+            alpha_guard_hysteresis_margin = 0.02
+    alpha_guard_hysteresis_margin = max(0.0, float(alpha_guard_hysteresis_margin))
+
+    min_update_samples_raw = alpha_guard_section.get("min_update_samples")
+    if min_update_samples_raw is None:
+        alpha_guard_min_update_samples = 2
+    else:
+        try:
+            alpha_guard_min_update_samples = int(min_update_samples_raw)
+        except (TypeError, ValueError):
+            alpha_guard_min_update_samples = 2
+    if alpha_guard_min_update_samples <= 0:
+        alpha_guard_min_update_samples = 1
+
+    max_lambda_delta_raw = alpha_guard_section.get("max_lambda_delta")
+    if max_lambda_delta_raw is None:
+        alpha_guard_max_lambda_delta = 0.05
+    else:
+        try:
+            alpha_guard_max_lambda_delta = float(max_lambda_delta_raw)
+        except (TypeError, ValueError):
+            alpha_guard_max_lambda_delta = 0.05
+    alpha_guard_max_lambda_delta = max(0.0, float(alpha_guard_max_lambda_delta))
+
+    max_target_adjustment_delta_raw = alpha_guard_section.get("max_target_adjustment_delta")
+    if max_target_adjustment_delta_raw is None:
+        alpha_guard_max_target_adjustment_delta = 0.1
+    else:
+        try:
+            alpha_guard_max_target_adjustment_delta = float(max_target_adjustment_delta_raw)
+        except (TypeError, ValueError):
+            alpha_guard_max_target_adjustment_delta = 0.1
+    alpha_guard_max_target_adjustment_delta = max(0.0, float(alpha_guard_max_target_adjustment_delta))
+
+    max_penalty_weight_delta_raw = alpha_guard_section.get("max_penalty_weight_delta")
+    if max_penalty_weight_delta_raw is None:
+        alpha_guard_max_penalty_weight_delta = 0.05
+    else:
+        try:
+            alpha_guard_max_penalty_weight_delta = float(max_penalty_weight_delta_raw)
+        except (TypeError, ValueError):
+            alpha_guard_max_penalty_weight_delta = 0.05
+    alpha_guard_max_penalty_weight_delta = max(0.0, float(alpha_guard_max_penalty_weight_delta))
+
     alpha_guard_cfg = AlphaGuardConfig(
         enabled=bool(alpha_guard_section.get("enabled", True)),
         check_interval=int(alpha_guard_section.get("check_interval", 200) or 200),
@@ -2717,6 +2817,11 @@ def parse_config(path: Path):
         min_target_weight=alpha_guard_min_target_weight,
         warmup_enforce_steps=alpha_guard_warmup_enforce,
         adjustment_smoothing=alpha_guard_adjustment_smoothing,
+        hysteresis_margin=alpha_guard_hysteresis_margin,
+        min_update_samples=alpha_guard_min_update_samples,
+        max_lambda_delta=alpha_guard_max_lambda_delta,
+        max_target_adjustment_delta=alpha_guard_max_target_adjustment_delta,
+        max_penalty_weight_delta=alpha_guard_max_penalty_weight_delta,
     )
 
     mask_prefail_section = feature_raw.get("mask_prefail")
@@ -3098,24 +3203,39 @@ def parse_config(path: Path):
     return experiment, data, teacher, student, train_cfg, loss_cfg, logging_cfg, feature_cfg, feature_aux_cfg
 
 
-def set_seed(seed: int, *, strict_pythonhash: bool = True) -> None:
+def set_seed(
+    seed: int,
+    *,
+    strict_pythonhash: bool = True,
+    require_cublas_determinism: bool = True,
+) -> None:
     workspace_config = os.environ.get("CUBLAS_WORKSPACE_CONFIG")
-    if workspace_config in {":16:8", ":4096:8"}:
-        print(f"[seed] CUBLAS_WORKSPACE_CONFIG={workspace_config} (deterministic cuBLAS kernels enabled).")
-    elif workspace_config:
+    deterministic_configs = {":16:8", ":4096:8"}
+    if require_cublas_determinism:
+        if workspace_config not in deterministic_configs:
+            raise SystemExit(
+                "[seed] CUBLAS_WORKSPACE_CONFIG is %s; set to ':16:8' or ':4096:8' before launching to enable deterministic cuBLAS kernels." % (workspace_config or "unset")
+            )
         print(
-            "[seed] Warning: CUBLAS_WORKSPACE_CONFIG=%s may be non-deterministic; unset or use ':16:8' / ':4096:8' if reproducibility drifts." % workspace_config
+            f"[seed] CUBLAS_WORKSPACE_CONFIG={workspace_config} (deterministic cuBLAS kernels enabled)."
         )
     else:
-        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-        workspace_config = ":4096:8"
-        print("[seed] CUBLAS_WORKSPACE_CONFIG unset; forcing ':4096:8' for deterministic cuBLAS kernels.")
+        if workspace_config in deterministic_configs:
+            print(
+                f"[seed] CUBLAS_WORKSPACE_CONFIG={workspace_config} (deterministic cuBLAS kernels enabled)."
+            )
+        elif workspace_config:
+            print(
+                "[seed] Warning: CUBLAS_WORKSPACE_CONFIG=%s may be non-deterministic; unset or use ':16:8' / ':4096:8' if reproducibility drifts." % workspace_config
+            )
+        else:
+            os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+            workspace_config = ":4096:8"
+            print("[seed] CUBLAS_WORKSPACE_CONFIG unset; forcing ':4096:8' for deterministic cuBLAS kernels.")
 
     hash_seed = os.environ.get("PYTHONHASHSEED")
     if hash_seed != str(seed):
-        message = (
-            f"[seed] PYTHONHASHSEED is {hash_seed or 'unset'}; expected {seed} for reproducibility."
-        )
+        message = f"[seed] PYTHONHASHSEED is {hash_seed or 'unset'}; expected {seed} for reproducibility."
         if strict_pythonhash:
             raise SystemExit(message + " Export PYTHONHASHSEED before launching.")
         print(message + " Setting PYTHONHASHSEED in-process for evaluation.")
@@ -3396,7 +3516,7 @@ def train(
 
         atexit.register(_close_tensorboard_writer)
 
-    strict_pythonhash = _coerce_bool(os.getenv("KILOGS_STRICT_PYHASH"), default=False)
+    strict_pythonhash = _coerce_bool(os.getenv("KILOGS_STRICT_PYHASH"), default=True)
     if not strict_pythonhash:
         expected_hash = str(experiment.seed)
         current_hash = os.environ.get("PYTHONHASHSEED")
@@ -3406,7 +3526,15 @@ def train(
                 flush=True,
             )
             os.environ["PYTHONHASHSEED"] = expected_hash
-    set_seed(experiment.seed, strict_pythonhash=strict_pythonhash)
+    require_cublas_determinism = _coerce_bool(
+        os.getenv("KILOGS_REQUIRE_CUBLAS_DETERMINISM"),
+        default=True,
+    )
+    set_seed(
+        experiment.seed,
+        strict_pythonhash=strict_pythonhash,
+        require_cublas_determinism=require_cublas_determinism,
+    )
 
     dataset = LegoRayDataset(data_cfg)
 
@@ -3764,6 +3892,20 @@ def train(
             return float(target)
         return current + (target - current) * smoothing
 
+    def _apply_rate_limit(current: float, proposed: float, max_delta: float) -> float:
+        if not math.isfinite(proposed):
+            return float(current)
+        if max_delta <= 0.0 or not math.isfinite(max_delta):
+            return float(proposed)
+        if not math.isfinite(current):
+            current = float(proposed)
+        delta = float(proposed) - float(current)
+        if delta > max_delta:
+            return float(current) + float(max_delta)
+        if delta < -max_delta:
+            return float(current) - float(max_delta)
+        return float(proposed)
+
     opacity_lambda_runtime = float(loss_cfg.opacity_lambda)
     opacity_target_adjustment = 1.0
     alpha_guard_initial_weight_raw = alpha_guard_cfg.initial_weight
@@ -3790,6 +3932,29 @@ def train(
         alpha_guard_enforce_steps = max(int(loss_cfg.opacity_target_warmup_steps or 0) + opacity_warm_start_offset, 0)
     else:
         alpha_guard_enforce_steps = max(alpha_guard_enforce_steps + opacity_warm_start_offset, 0)
+    alpha_guard_hysteresis_margin = max(
+        0.0,
+        float(getattr(alpha_guard_cfg, "hysteresis_margin", 0.0) or 0.0),
+    )
+    alpha_guard_min_update_samples = max(
+        1,
+        int(getattr(alpha_guard_cfg, "min_update_samples", 1) or 1),
+    )
+    alpha_guard_max_lambda_delta = max(
+        0.0,
+        float(getattr(alpha_guard_cfg, "max_lambda_delta", 0.0) or 0.0),
+    )
+    alpha_guard_max_adjustment_delta = max(
+        0.0,
+        float(getattr(alpha_guard_cfg, "max_target_adjustment_delta", 0.0) or 0.0),
+    )
+    alpha_guard_max_penalty_delta = max(
+        0.0,
+        float(getattr(alpha_guard_cfg, "max_penalty_weight_delta", 0.0) or 0.0),
+    )
+    alpha_guard_tighten_streak = 0
+    alpha_guard_relax_streak = 0
+    alpha_guard_last_direction: Optional[str] = None
 
     mask_prefail_cfg = train_cfg.mask_prefail or MaskPrefailConfig()
     mask_prefail_window = max(4, int(mask_prefail_cfg.window))
@@ -3909,6 +4074,25 @@ def train(
             alpha_penalty_weight = _clamp_penalty_weight(alpha_guard_state.get("penalty_weight", alpha_penalty_weight))
             alpha_guard_avg_penalty = float(alpha_guard_state.get("avg_penalty", alpha_guard_avg_penalty))
             alpha_guard_last_update_step = int(alpha_guard_state.get("last_update_step", start_step) or start_step)
+            direction_raw = alpha_guard_state.get("last_direction")
+            if isinstance(direction_raw, str):
+                normalized_direction = direction_raw.strip().lower()
+                if normalized_direction in {"tighten", "relax"}:
+                    alpha_guard_last_direction = normalized_direction
+                else:
+                    alpha_guard_last_direction = None
+            tighten_streak_raw = alpha_guard_state.get("tighten_streak")
+            if tighten_streak_raw is not None:
+                try:
+                    alpha_guard_tighten_streak = max(0, int(tighten_streak_raw))
+                except (TypeError, ValueError):
+                    alpha_guard_tighten_streak = 0
+            relax_streak_raw = alpha_guard_state.get("relax_streak")
+            if relax_streak_raw is not None:
+                try:
+                    alpha_guard_relax_streak = max(0, int(relax_streak_raw))
+                except (TypeError, ValueError):
+                    alpha_guard_relax_streak = 0
             history_raw = alpha_guard_state.get("history")
             if isinstance(history_raw, (list, tuple)):
                 alpha_guard_penalty_history.clear()
@@ -4032,6 +4216,9 @@ def train(
             "avg_penalty": float(alpha_guard_avg_penalty),
             "last_update_step": int(alpha_guard_last_update_step),
             "history": [float(value) for value in alpha_guard_penalty_history],
+            "last_direction": str(alpha_guard_last_direction or ""),
+            "tighten_streak": int(alpha_guard_tighten_streak),
+            "relax_streak": int(alpha_guard_relax_streak),
         }
         state["mask_prefail_state"] = {
             "history": [
@@ -5100,28 +5287,98 @@ def train(
                     if not math.isfinite(avg_penalty):
                         avg_penalty = 0.0
                     alpha_guard_avg_penalty = avg_penalty
-                    if avg_penalty > alpha_guard_cfg.penalty_hi:
-                        opacity_lambda_target = max(
+                    tighten_threshold = float(alpha_guard_cfg.penalty_hi)
+                    relax_threshold = float(alpha_guard_cfg.penalty_lo)
+                    if alpha_guard_last_direction == "relax":
+                        tighten_threshold += alpha_guard_hysteresis_margin
+                    if alpha_guard_last_direction == "tighten":
+                        relax_threshold = max(0.0, relax_threshold - alpha_guard_hysteresis_margin)
+
+                    action: Optional[str] = None
+                    if avg_penalty > tighten_threshold:
+                        alpha_guard_tighten_streak += 1
+                        alpha_guard_relax_streak = 0
+                        if alpha_guard_tighten_streak >= alpha_guard_min_update_samples:
+                            action = "tighten"
+                    elif avg_penalty < relax_threshold:
+                        alpha_guard_relax_streak += 1
+                        alpha_guard_tighten_streak = 0
+                        if alpha_guard_relax_streak >= alpha_guard_min_update_samples:
+                            action = "relax"
+                    else:
+                        alpha_guard_tighten_streak = 0
+                        alpha_guard_relax_streak = 0
+
+                    if action == "tighten":
+                        proposed_lambda_target = max(
                             alpha_guard_cfg.lambda_floor,
                             opacity_lambda_target * float(alpha_guard_cfg.tighten_rate),
                         )
-                        opacity_target_adjustment_target = _clamp_target_adjustment(
+                        proposed_target_adjustment = _clamp_target_adjustment(
                             opacity_target_adjustment_target * float(alpha_guard_cfg.relax_rate)
                         )
-                        alpha_penalty_weight_target = _clamp_penalty_weight(
+                        proposed_penalty_weight = _clamp_penalty_weight(
                             alpha_penalty_weight_target * float(alpha_guard_cfg.relax_rate)
                         )
-                    elif avg_penalty < alpha_guard_cfg.penalty_lo:
-                        opacity_lambda_target = min(
+                        opacity_lambda_target = _clamp_lambda(
+                            _apply_rate_limit(
+                                opacity_lambda_target,
+                                proposed_lambda_target,
+                                alpha_guard_max_lambda_delta,
+                            )
+                        )
+                        opacity_target_adjustment_target = _clamp_target_adjustment(
+                            _apply_rate_limit(
+                                opacity_target_adjustment_target,
+                                proposed_target_adjustment,
+                                alpha_guard_max_adjustment_delta,
+                            )
+                        )
+                        alpha_penalty_weight_target = _clamp_penalty_weight(
+                            _apply_rate_limit(
+                                alpha_penalty_weight_target,
+                                proposed_penalty_weight,
+                                alpha_guard_max_penalty_delta,
+                            )
+                        )
+                        alpha_guard_last_direction = "tighten"
+                        alpha_guard_tighten_streak = 0
+                        alpha_guard_relax_streak = 0
+                    elif action == "relax":
+                        proposed_lambda_target = min(
                             alpha_guard_cfg.lambda_cap,
                             opacity_lambda_target * float(alpha_guard_cfg.relax_rate),
                         )
-                        opacity_target_adjustment_target = _clamp_target_adjustment(
+                        proposed_target_adjustment = _clamp_target_adjustment(
                             opacity_target_adjustment_target * float(alpha_guard_cfg.tighten_rate)
                         )
-                        alpha_penalty_weight_target = _clamp_penalty_weight(
+                        proposed_penalty_weight = _clamp_penalty_weight(
                             alpha_penalty_weight_target * float(alpha_guard_cfg.tighten_rate)
                         )
+                        opacity_lambda_target = _clamp_lambda(
+                            _apply_rate_limit(
+                                opacity_lambda_target,
+                                proposed_lambda_target,
+                                alpha_guard_max_lambda_delta,
+                            )
+                        )
+                        opacity_target_adjustment_target = _clamp_target_adjustment(
+                            _apply_rate_limit(
+                                opacity_target_adjustment_target,
+                                proposed_target_adjustment,
+                                alpha_guard_max_adjustment_delta,
+                            )
+                        )
+                        alpha_penalty_weight_target = _clamp_penalty_weight(
+                            _apply_rate_limit(
+                                alpha_penalty_weight_target,
+                                proposed_penalty_weight,
+                                alpha_guard_max_penalty_delta,
+                            )
+                        )
+                        alpha_guard_last_direction = "relax"
+                        alpha_guard_tighten_streak = 0
+                        alpha_guard_relax_streak = 0
                     alpha_guard_acc_penalty = 0.0
                     alpha_guard_sample_count = 0
                     alpha_guard_last_update_step = global_step
@@ -5732,6 +5989,31 @@ def train(
             log_metrics["alpha_penalty_core"] = alpha_penalty_core.detach()
             log_metrics["alpha_penalty_weight"] = torch.tensor(alpha_penalty_weight, device=device)
             log_metrics["alpha_guard_avg_penalty"] = torch.tensor(alpha_guard_avg_penalty, device=device)
+            log_metrics["alpha_penalty_weight_target"] = torch.tensor(
+                alpha_penalty_weight_target,
+                device=device,
+            )
+            log_metrics["opacity_target_adjustment_target"] = torch.tensor(
+                opacity_target_adjustment_target,
+                device=device,
+            )
+            log_metrics["opacity_lambda_target"] = torch.tensor(opacity_lambda_target, device=device)
+            log_metrics["alpha_guard_tighten_streak"] = torch.tensor(
+                float(alpha_guard_tighten_streak),
+                device=device,
+            )
+            log_metrics["alpha_guard_relax_streak"] = torch.tensor(
+                float(alpha_guard_relax_streak),
+                device=device,
+            )
+            direction_code: float
+            if alpha_guard_last_direction == "tighten":
+                direction_code = 1.0
+            elif alpha_guard_last_direction == "relax":
+                direction_code = -1.0
+            else:
+                direction_code = 0.0
+            log_metrics["alpha_guard_last_direction"] = torch.tensor(direction_code, device=device)
             if feature_src_dim_value is not None:
                 log_metrics["feature_src_dim"] = torch.tensor(float(feature_src_dim_value), device=device)
             if projector_out_dim_value is not None:

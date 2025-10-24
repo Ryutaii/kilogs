@@ -1,0 +1,216 @@
+[debug] importing lego_response_distill from /mnt/d/imaizumi/kilogs/distill/lego_response_distill.py
+[logging] TensorBoard writer initialised → logs/lego/feat_t_full/runs/feature_distill_v11_debug10k/tensorboard
+[seed] CUBLAS_WORKSPACE_CONFIG unset; forcing ':4096:8' for deterministic cuBLAS kernels.
+[seed] PYTHONHASHSEED aligned to 2025.
+[dataset] Loaded teacher supervision frames: 200 @ 800x800, has_depth=True
+[feature_pipeline] loaded gaussian teacher features with dimension 52
+[feature_pipeline] comparison feature dim=52, projector in/out=(64->52)
+[feature_pipeline] student-space policy bypassed for compare_space='teacher'
+[phase] Loaded schedule: student_rgb_feature:1-50000
+[gate] promotion_gates unspecified; defaulting to (10000, 20000, 50000)
+[phase] Enter student_rgb_feature [1-50000] optimize=['student'] mask_override=inherit feature_scale=1.000
+[debug_start] start_step=0
+[init] Entering first KiloNeRF forward pass (may take several minutes).
+[init] First KiloNeRF forward pass finished; continuing with training loop.
+Saved checkpoint to results/lego/feat_t_full/runs/feature_distill_v11_debug10k/checkpoints/step_005000.pth
+[feature_pipeline] feature_mask_fraction unavailable at step 6500; skipping coverage check for this step.
+[feature_pipeline] Mask prefail trigger: p5_rate=nan, min_rate=nan, threshold=0.0960
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000470, min_rate=0.000000, threshold=0.0960
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000000, min_rate=0.000000, threshold=0.0960
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000000, min_rate=0.000000, threshold=0.0960
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000051, min_rate=0.000000, threshold=0.0960
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000067, min_rate=0.000000, threshold=0.0960
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000002, min_rate=0.000000, threshold=0.0960
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000034, min_rate=0.000000, threshold=0.0960
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000103, min_rate=0.000000, threshold=0.0960
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000025, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000030, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000106, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000082, min_rate=0.000000, threshold=0.2400
+[gate] Promotion gate passed at step 10000 (mask=0.663, feature_dim=64, projector_dim=52, feature_scale=1.000, feature_ratio=1.00, opacity_ratio=1.00, feature_sched=Y, opacity_sched=Y)
+Saved checkpoint to results/lego/feat_t_full/runs/feature_distill_v11_debug10k/checkpoints/step_010000.pth
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000124, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000241, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000037, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000072, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000712, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000022, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000175, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000297, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000517, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000024, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000051, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000072, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000231, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000084, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000979, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000065, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000521, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000152, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000272, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000171, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000085, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000679, min_rate=0.000000, threshold=0.2400
+Saved checkpoint to results/lego/feat_t_full/runs/feature_distill_v11_debug10k/checkpoints/step_015000.pth
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000521, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000046, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000022, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000144, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000018, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000029, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000031, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000107, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000098, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000647, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000504, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000296, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000058, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000096, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000093, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000186, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000055, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000112, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000053, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000362, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000065, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000121, min_rate=0.000000, threshold=0.2400
+[gate] Promotion gate passed at step 20000 (mask=0.526, feature_dim=64, projector_dim=52, feature_scale=1.000, feature_ratio=1.00, opacity_ratio=1.00, feature_sched=Y, opacity_sched=Y)
+Saved checkpoint to results/lego/feat_t_full/runs/feature_distill_v11_debug10k/checkpoints/step_020000.pth
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000004, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000037, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000170, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000060, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000057, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000096, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000046, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000001, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000028, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000134, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000072, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000009, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000008, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000028, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000044, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000351, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000259, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000051, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000024, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000631, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000377, min_rate=0.000000, threshold=0.2400
+Saved checkpoint to results/lego/feat_t_full/runs/feature_distill_v11_debug10k/checkpoints/step_025000.pth
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000458, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000016, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000049, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000061, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000074, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000069, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000594, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000124, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000007, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000043, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000566, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000010, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000006, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000472, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000402, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000428, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000040, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000060, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000099, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000554, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000452, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000087, min_rate=0.000000, threshold=0.2400
+Saved checkpoint to results/lego/feat_t_full/runs/feature_distill_v11_debug10k/checkpoints/step_030000.pth
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000029, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000080, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000010, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000074, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000060, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000498, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000356, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000058, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000574, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000028, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000431, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000076, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000463, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000394, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000049, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000135, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000122, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000089, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000278, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000004, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000074, min_rate=0.000000, threshold=0.2400
+Saved checkpoint to results/lego/feat_t_full/runs/feature_distill_v11_debug10k/checkpoints/step_035000.pth
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000463, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000194, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000016, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000042, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000215, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000167, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000050, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000184, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000032, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000018, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000062, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000033, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000041, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000102, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000004, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000048, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000059, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000085, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000006, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000092, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000052, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000318, min_rate=0.000000, threshold=0.2400
+Saved checkpoint to results/lego/feat_t_full/runs/feature_distill_v11_debug10k/checkpoints/step_040000.pth
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000580, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000210, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000066, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000061, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000342, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000110, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000028, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000008, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000107, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000362, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000112, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000213, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000105, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000118, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000019, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000135, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000068, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000128, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000019, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000309, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000084, min_rate=0.000000, threshold=0.2400
+Saved checkpoint to results/lego/feat_t_full/runs/feature_distill_v11_debug10k/checkpoints/step_045000.pth
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000162, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000027, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000070, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000064, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000002, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000057, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000005, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000012, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000003, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000069, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000045, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000024, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000006, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000009, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000025, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000079, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000007, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000020, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000017, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=-0.000142, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000144, min_rate=0.000000, threshold=0.2400
+[feature_pipeline] Mask prefail trigger: p5_rate=0.000275, min_rate=0.000000, threshold=0.2400
+[gate] Promotion gate passed at step 50000 (mask=0.494, feature_dim=64, projector_dim=52, feature_scale=1.000, feature_ratio=1.00, opacity_ratio=1.00, feature_sched=Y, opacity_sched=Y)
+Saved checkpoint to results/lego/feat_t_full/runs/feature_distill_v11_debug10k/checkpoints/step_050000.pth
+Final checkpoint saved to results/lego/feat_t_full/runs/feature_distill_v11_debug10k/checkpoints/step_050000.pth
+

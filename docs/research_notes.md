@@ -46,6 +46,100 @@ Stable, reproducible pipeline for rendering & evaluating student vs teacher on *
 
 ---
 
+## 2025-10-24 — 特徴蒸留v11 中間チェックポイント評価 (step_025000)
+
+* 白背景レンダを再生成: 既存の `eval_white_step025000/` を削除後、
+
+  ```bash
+  conda run --no-capture-output -n kilogs python -m distill.render_student \
+    --config configs/generated/lego_feature_student_rgb_fourier_dir_depth030_alpha075_feature50k_debug10k.yaml \
+    --checkpoint results/lego/feat_t_full/runs/feature_distill_v11_debug10k/checkpoints/step_025000.pth \
+    --output-dir results/lego/feat_t_full/runs/feature_distill_v11_debug10k/eval_white_step025000 \
+    --store-rgba
+  ```
+
+  FPS は 0.132（1 枚 ≈7.6 秒）、GPU 使用量ピークは 1.33 GiB (`render_stats.json` より)。
+* `tools/eval_consistency.py --recompute-metrics` を同ディレクトリに対して実行し、`metrics_white.json` + `metrics_summary.csv` を更新。結果は PSNR 12.10 / SSIM 0.7447 / LPIPS 0.2891。50K checkpoint (PSNR 13.06) よりわずかに低いが、LPIPS は 0.2967→0.2891 と改善傾向。
+* `training_metrics.csv` を参照すると、step 25000 時点の `total=0.1708` が valley。直後の step 26000 で `total=0.2413` (color loss 0.094) まで跳ね上がり、その後 50K まで 0.24 付近で推移。1000-step 移動平均の最良値 (0.2370) も step 25993 で止まっているため、25K チェックポイント付近で早期停止する方が安定。
+* α ガード: 25K 時点で 0.039、50K では 0.047〜0.050 に上昇。feature/cosine loss が後半で再増大していることも踏まえ、v12 では feature schedule を 4K→12K step で強めに入れたあと、30K 以降は緩やかに落とし込む（cosine weight を 0.01→0.02→0.015 など）。
+* 追評価: step_030000 でも同手順でレンダ＋評価を実施。白背景メトリクスは PSNR 12.36 / SSIM 0.7452 / LPIPS 0.2902、25K と 50K の中間に位置。loss CSV 上では 30K 付近で `total≈0.22`、color/feature がともに上昇し α guard penalty も 0.05 まで戻っている。30K〜34K の窓平均では `total≈0.242` と 25K より明らかに高い。
+* 次アクション（v12 設計用メモ）:
+  1. step_030000 も同様にレンダ＋評価してトレンドを補完（25K ←→ 50K の差分を補間）。
+  2. `loss.feature_schedule` の後段を cosine decay に変更し、30K 以降で feature_weight を 0.04 前後へ収束させる案を config に反映。
+  3. α guard の `min_target_weight` を 0.03 に据えたうえで、`adjustment_smoothing` を 0.10 付近まで下げて追従性を向上させる（v12 の draft で試す）。
+
+## 2025-10-24 — 評価整合＆制御系リファイン計画
+- シングルビュー sanity check: `tools/run_single_view_overfit.py --config configs/generated/lego_single_view_overfit_v1.yaml --max-steps 10000 --overfit-steps 10000 --frame-index 0` を実行し、`results/lego/single_view_overfit_v1/eval_single_view_step010000_view000/` に成果物を保存。白背景 PSNR 7.89 dB / SSIM 0.655 / LPIPS 0.369（前景 PSNR 同値）で目標の 30 dB には未達。α 圧・バッチサイズ・学生容量・表現形式のどこが律速か切り分けが必要。`metrics_summary.csv` に `single_view_overfit_v1_step010000_view000` 行を追加済み。
+
+**ボトルネック認識**
+- 評価パイプラインの不整合（sRGB↔linear や straight α 混在）が残り、PSNR が 10〜13 dB 付近で頭打ち。
+- α/深度の制御が強すぎて白飛びが増え、25K valley 以降に total が反発。
+- view-dependent 分岐を入れても土台が揺れており、feature 蒸留が不安定化要因になっている。
+
+**P0: 評価整合の再固定（最優先）**
+- 教師・学生とも linear RGB で比較する。PNG ロード時は gAMA/sBIT の影響を捨て、sRGB→linear を同手順で適用。
+- アルファは straight α 前提で統一し、白合成は `rgb*α + (1-α)`。pre-multiplied 混入を禁止。
+- 白背景 PSNR と並列で「前景 PSNR（教師 α 積分 > 0.7）」を常設する。
+- 単視点オーバーフィット（EMA モードで PSNR ≥30dB）を毎回サニティチェック。
+- 評価は EMA ウェイトのみで実施し、レンダ時に EMA のロードを必ず確認。
+- 直近アクション: 評価スクリプト群を linear/straight α 前提へ点検し、前景 PSNR 算出と単視点テスト（既存教師フレーム）を 2025-10-25 JST 午前までに完了する。結果を `metrics_summary.csv` に新カラム追加で記録する。
+
+**P1: α・深度制御を「遅く・弱く・滑らかに」**
+- α 目標追従は EMA 判定（β=0.9〜0.98）＋連続未達 K step のみ増加。増分は +0.002/step 以下、減少はその半分。
+- 有効重みの頭打ちは 0.12〜0.15。ヒステリシスとレート制限を実装する。
+- 深度ロスは前景限定＋Huber 幅を広げ、重みを 0.06〜0.08 から開始。
+- 勾配ノルム比（color:α:depth≈1:0.3:0.3）と透過率ヒストグラムを記録する仕組みをログへ追加。
+
+**P2: view-dependent の寄与を遅らせる**
+- 方向ブランチは late fusion、低 LR（または係数 0.5）でウォームアップしながら徐々に立ち上げる。
+- dir L は L=4 を基準に、L=2/6 を 10k ランで A/B。終盤 1k の color loss または前景 PSNR が +5% 以上改善し、α スパイク頻度が悪化しない場合のみ採択。
+
+**P3: 25k 付近で早期停止 + EMA/SWA**
+- 22k〜28k でチェックポイント帯を作り、EMA 評価＋SWA で最終化。50k への惰性延長を避ける。
+
+**P4: サンプリング & near/far**
+- 初期は軽サンプルで開始し、後半で濃くする漸増を採用。遠景ノイズに引かれないよう free-space 抑制を緩める。
+- 教師密度に応じた重み付き再サンプルを診断用途で用意。
+
+**P5: feature は土台安定後に導入**
+- GO 条件: 単視点 ≥30dB、10k/20k で loss/total 非増、loss/color ≤0.06、α スパイク ≤2%。
+- cosine → L2 の順で小さく立ち上げ、projector LR は学生の ≤0.5。安定後は凍結オプション。
+- 比較空間は 64D で統一し、z-score や L2 正規化でチャネル寄与を均す。
+
+**Open Questions（即答メモ）**
+- feature を今入れるか → NO。応答蒸留を安定化させてから。
+- 比較空間 64D の是非 → OK。統一しやすい。正規化は必須。
+- dirL の評価方針 → L=4 を軸に 10k A/B。改善 +5% かつスパイク増なしで採択。
+- α guard は penalty/relax 調整だけで足りるか → 足りない。ヒステリシス＋レート制限＋百分位駆動へリファクタ必須。
+
+**次の48時間プラン（手順）**
+1. P0 一式の再検証（linear/sRGB・straight α・前景 PSNR・単視点 30dB・EMA 評価）。
+2. α/深度制御系を「遅く・弱く・滑らかに」へ変更（ヒステリシス＋レート制限）。
+3. dirL A/B（L=2/4/6）を 10k×3 で実施し、終盤 1k の color loss / 前景 PSNR / α スパイク頻度を比較。
+4. 勝ち設定で 20k 延伸（スケジュールは時間等価で再設計）。
+5. 22k〜28k に早期停止ウィンドウを張り、EMA＋SWA で最良値抽出。
+6. GO 条件が揃ったら feature を段階的に再導入（cos→L2、小さく、projector 低 LR→凍結）。
+
+**追加リスクメモ**
+- PNG の色管理（gAMA/sBIT）とライブラリ差（PIL vs OpenCV）で linear 化がズレやすい。処理系を一本化する。
+- depth の単位／正規化が教師と一致しているか再確認。
+- projector/teacher-adapter が動き続けると基準が揺れる。安定後に停止する。
+
+**直近の具体アクション（2025-10-24 夕方開始）**
+- [ ] `tools/evaluate_student_metrics.py` 系の sRGB→linear・straight α 処理を確認し、差分があれば修正案を 2025-10-25 10:00 JST までにまとめる。
+- [x] `tools/evaluate_student_metrics.py` に linear/straight α パイプラインと前景PSNR算出を実装（2025-10-24）。
+- [x] `tools/evaluate_student_metrics.py` に linear/straight α パイプラインと前景PSNR算出を実装（2025-10-24）。
+- [x] v11 debug10k (step 25k / 30k / 50k) を新パイプラインで再評価。白背景 PSNR はそれぞれ 10.11 / 10.36 / 11.02 dB（前景 PSNR 同値）まで低下し、既存 `metrics_summary.csv` を `--force-update` で上書き。旧指標との差は linear 化＆strict α 合成の影響と判断。
+- [x] 単視点オーバーフィット用スクリプト `tools/run_single_view_overfit.py` と専用 config `configs/generated/lego_single_view_overfit_v1.yaml` を追加。`--overfit-mode student` + 固定 1 フレームで 2k/10k step ランを実施したが、現状 PSNR は 7.8〜7.9 dB 止まり。α 圧と学生容量の見直しが必要。
+- [x] `DataConfig` に `max_frames` / `frame_indices` を追加し、単視点データセットを YAML で表現できるようにした（評価・レンダ両方で同じ JSON から対象フレームのみ抽出可能）。
+- [x] `distill/lego_response_distill.py` の α guard をヒステリシス＋レート制限で再設計（連続違反判定＋更新幅制限を実装, 2025-10-24）。
+- [x] `distill/lego_response_distill.py` に deterministic 起動ガード（`PYTHONHASHSEED` と `CUBLAS_WORKSPACE_CONFIG` の事前チェック）を追加し、未設定での学習開始を強制終了させるようにした（2025-10-24）。
+- [ ] dirL=2/4/6 用の 10k コンフィグ雛形を `configs/generated/` に作成し、Day1 スイープの準備を完了させる。
+- 完了後、`research_notes.md` へチェックリスト進捗を追記し、`metrics_summary.csv` に前景 PSNR カラムを追加する。
+
+* α guard は平均ペナルティのヒステリシス判定＋連続違反カウンタで動作し、`lambda`/target/penalty の各ターゲットは per-update Δ 上限でレート制限されるようになった。チェックポイントにも方向・連続カウントを保存して再開時に継続可能。
+* KiloNeRF のセル境界ぎれ対策として tri/d-linear 補間（近傍セルからの線形合成）を検討中。サンプルが属する 8 セルを列挙してサブ MLP 出力を重み付きに混ぜる案を要タスク化（実装コスト高のため要調整）。
+
 ## 2025-10-23 — 特徴蒸留v11 デバッグランと TensorBoard 指標整理
 
 * `distill/lego_response_distill.py` の TensorBoard 出力を整理。`full=True` で記録するスカラーを `loss/color`, `loss/opacity`, `loss/depth`, `loss/feature_recon`, `loss/feature_cosine`, `opacity/alpha_guard_penalty`, `opacity/target_weight_effective` の計 7 本へ縮小。

@@ -7,6 +7,7 @@ import argparse
 import csv
 import importlib.util
 import json
+import math
 import re
 import time
 from pathlib import Path
@@ -43,11 +44,38 @@ ssim_fn = loss_utils.ssim  # type: ignore[attr-defined]
 from lpipsPyTorch.modules.lpips import LPIPS  # type: ignore  # noqa: E402
 
 
-def load_image(path: Path, device: torch.device) -> torch.Tensor:
-    image = Image.open(path).convert("RGB")
-    array = np.asarray(image, dtype=np.float32) / 255.0
-    tensor = torch.from_numpy(array).permute(2, 0, 1).unsqueeze(0).contiguous()
-    return tensor.to(device)
+def _srgb_to_linear(rgb: np.ndarray) -> np.ndarray:
+    linear = np.where(
+        rgb <= 0.04045,
+        rgb / 12.92,
+        np.power((rgb + 0.055) / 1.055, 2.4),
+    )
+    return linear.astype(np.float32, copy=False)
+
+
+def _load_image_data(path: Path, device: torch.device) -> Dict[str, torch.Tensor]:
+    with Image.open(path) as pil_image:
+        image = pil_image.convert("RGBA")
+
+    array = np.asarray(image, dtype=np.float32) / 255.0  # H x W x 4
+    rgb_srgb = array[..., :3]
+    alpha = array[..., 3:4]
+
+    rgb_linear = _srgb_to_linear(rgb_srgb)
+    alpha = np.clip(alpha, 0.0, 1.0).astype(np.float32, copy=False)
+    white_linear = rgb_linear * alpha + (1.0 - alpha)
+
+    def to_tensor(data: np.ndarray) -> torch.Tensor:
+        return torch.from_numpy(data).permute(2, 0, 1).unsqueeze(0).contiguous().to(device)
+
+    alpha_2d = alpha[..., 0]
+    alpha_tensor = torch.from_numpy(alpha_2d).unsqueeze(0).unsqueeze(0).contiguous().to(device)
+
+    return {
+        "rgb_linear": to_tensor(rgb_linear),
+        "white_linear": to_tensor(white_linear),
+        "alpha": alpha_tensor,
+    }
 
 
 def _natural_key(name: str) -> List[object]:
@@ -93,6 +121,7 @@ def compute_metrics(
     psnr_values: List[float] = []
     ssim_values: List[float] = []
     lpips_values: List[float] = []
+    psnr_foreground_values: List[float] = []
 
     pair_list = list(pairs)
     total = len(pair_list)
@@ -115,17 +144,32 @@ def compute_metrics(
     )
 
     for idx, (student_path, teacher_path) in enumerate(progress_bar, start=1):
-        student_img = load_image(student_path, device)
-        teacher_img = load_image(teacher_path, device)
+        student_data = _load_image_data(student_path, device)
+        teacher_data = _load_image_data(teacher_path, device)
+
+        student_white = student_data["white_linear"]
+        teacher_white = teacher_data["white_linear"]
 
         with torch.no_grad():
-            psnr_val = psnr_fn(student_img, teacher_img).mean().item()
-            ssim_val = ssim_fn(student_img, teacher_img).item()
-            lpips_val = lpips_model(student_img, teacher_img).item()
+            psnr_val = psnr_fn(student_white, teacher_white).mean().item()
+            ssim_val = ssim_fn(student_white, teacher_white).item()
+            lpips_val = lpips_model(student_white, teacher_white).item()
 
         psnr_values.append(psnr_val)
         ssim_values.append(ssim_val)
         lpips_values.append(lpips_val)
+
+        teacher_alpha = teacher_data["alpha"]
+        foreground_mask = (teacher_alpha >= 0.7).to(student_white.dtype)
+        if torch.any(foreground_mask > 0.0):
+            student_rgb = student_data["rgb_linear"]
+            teacher_rgb = teacher_data["rgb_linear"]
+            mask = foreground_mask.expand_as(student_rgb)
+            diff = student_rgb - teacher_rgb
+            mse = torch.sum((diff ** 2) * mask) / torch.sum(mask)
+            mse = torch.clamp(mse, min=1e-12)
+            psnr_fg = float(-10.0 * math.log10(mse.item()))
+            psnr_foreground_values.append(psnr_fg)
 
         elapsed = time.perf_counter() - start_time
         views_per_s = idx / max(elapsed, 1e-6)
@@ -148,12 +192,17 @@ def compute_metrics(
     def avg(values: List[float]) -> float:
         return float(sum(values) / len(values))
 
-    return {
+    metrics: Dict[str, float] = {
         "num_images": len(psnr_values),
         "psnr": avg(psnr_values),
         "ssim": avg(ssim_values),
         "lpips": avg(lpips_values),
     }
+
+    if psnr_foreground_values:
+        metrics["psnr_foreground"] = avg(psnr_foreground_values)
+
+    return metrics
 
 
 def dump_results(metrics: Dict[str, float], output_json: Path | None, output_csv: Path | None) -> None:
@@ -181,6 +230,7 @@ SUMMARY_COLUMNS = [
     "psnr_black",
     "ssim_black",
     "lpips_black",
+    "psnr_foreground",
     "fps",
     "gpu_peak_gib",
     "power_avg_w",
@@ -233,6 +283,8 @@ def _update_summary_csv(
     background: str,
     metrics: Dict[str, float],
     render_stats: Dict[str, Optional[float]],
+    *,
+    force_update: bool = False,
 ) -> None:
     background = background.lower()
     if background not in {"white", "black"}:
@@ -260,7 +312,7 @@ def _update_summary_csv(
 
     should_update = True
     tolerance = 1e-6
-    if background == "white":
+    if not force_update and background == "white":
         existing_psnr = _parse_float(target_row.get("psnr_white"))
         new_psnr = float(metrics.get("psnr")) if metrics.get("psnr") is not None else None
         if existing_psnr is not None and new_psnr is not None:
@@ -282,7 +334,7 @@ def _update_summary_csv(
         "lpips": f"lpips_{background}",
     }
 
-    if should_update:
+    if should_update or force_update:
         for metric_key, column_name in prefix_map.items():
             value = metrics.get(metric_key)
             target_row[column_name] = _format_float(float(value)) if value is not None else ""
@@ -294,6 +346,10 @@ def _update_summary_csv(
                 target_row["gpu_peak_gib"] = _format_float(render_stats["gpu_peak_gib"])  # type: ignore[arg-type]
             if render_stats.get("power_avg_w") is not None:
                 target_row["power_avg_w"] = _format_float(render_stats["power_avg_w"])
+
+        foreground_psnr = metrics.get("psnr_foreground")
+        if foreground_psnr is not None:
+            target_row["psnr_foreground"] = _format_float(float(foreground_psnr))
 
     with summary_path.open("w", encoding="utf-8", newline="") as fp:
         writer = csv.DictWriter(fp, fieldnames=SUMMARY_COLUMNS)
@@ -368,6 +424,11 @@ def main() -> int:
         default=None,
         help="Method label to use when updating the summary CSV",
     )
+    parser.add_argument(
+        "--force-update",
+        action="store_true",
+        help="Overwrite summary row even when the new metrics are worse than the existing entry",
+    )
     args = parser.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -398,7 +459,14 @@ def main() -> int:
             parser.error("--summary requires --method-name to be provided")
         if args.background is None:
             parser.error("--summary requires --background to be specified")
-        _update_summary_csv(args.summary, args.method_name, args.background, metrics, render_stats)
+        _update_summary_csv(
+            args.summary,
+            args.method_name,
+            args.background,
+            metrics,
+            render_stats,
+            force_update=args.force_update,
+        )
 
     print(json.dumps(metrics, indent=2))
     return 0
@@ -406,19 +474,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-# --- PATCH: override load_image (safe, RGBA->white compose) ---
-def load_image(path, device):
-    import imageio.v3 as iio
-    import numpy as np
-    import torch
-    arr = iio.imread(path)  # HxWx(C)
-    arr = np.asarray(arr, dtype=np.float32)
-    if arr.ndim == 2:
-        arr = np.repeat(arr[..., None], 3, axis=2)
-    if arr.shape[2] == 4:
-        a = arr[..., 3:4] / 255.0
-        rgb = arr[..., :3] / 255.0
-        arr = rgb * a + (1.0 - a)   # white compose → 3ch
-        arr = (arr * 255.0).astype(np.float32)
-    arr = np.ascontiguousarray(arr / 255.0)
-    return torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(device)
