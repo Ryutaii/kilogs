@@ -140,6 +140,77 @@ Stable, reproducible pipeline for rendering & evaluating student vs teacher on *
 * α guard は平均ペナルティのヒステリシス判定＋連続違反カウンタで動作し、`lambda`/target/penalty の各ターゲットは per-update Δ 上限でレート制限されるようになった。チェックポイントにも方向・連続カウントを保存して再開時に継続可能。
 * KiloNeRF のセル境界ぎれ対策として tri/d-linear 補間（近傍セルからの線形合成）を検討中。サンプルが属する 8 セルを列挙してサブ MLP 出力を重み付きに混ぜる案を要タスク化（実装コスト高のため要調整）。
 
+## 2025-10-25 — 特徴蒸留v13 30K ラン報告
+
+* config: `configs/generated/lego_feature_student_rgb_fourier_dir_depth030_alpha075_feature50k_debug10k_v13.yaml`
+* 実行条件: `PYTHONHASHSEED=2025`, `CUBLAS_WORKSPACE_CONFIG=:4096:8`, `--max-steps 30000`
+* ラン完了。`logs/lego/feat_t_full/runs/feature_distill_v13_debug10k/` に TensorBoard/CSV、`results/.../checkpoints/step_030000.pth` まで出力を確認。
+* 軸トレンド: `loss/color` と `loss/opacity` は想定通り 30K まで緩やかに低下した一方、`loss/depth` が 26K 付近から微増（+0.004 前後）。`alpha_guard_penalty` は 0.05 台で安定。
+* 当面のTODO
+  * `training_metrics.csv` から 24K→30K 区間を抽出し、`loss/depth` / `loss/opacity` / `opacity_target_weight_effective` の相関を見る。
+  * worst-N depth ヒートマップを確認し、背景リークなのか前景誤差なのか切り分ける。
+  * 深度押し返し案: `loss.depth.weight` を 0.025〜0.028 へ下げる or `alpha_threshold` を 0.75 へ引き上げる短縮ラン（10K）で効果測定。
+
+メモ: 次スイープで深度重みを調整する際は v13 コンフィグを複写して差分だけ編集する。α 側は現状安定しているため触らない方針。
+
+### 2025-10-25 フィードバック反映 — 優先アクション（言葉だけで実行計画）
+
+**最優先 P0: 評価の固定とサニティ**
+- 教師=教師で linear 空間・straight α・白合成の自己一致テスト（∞/1/0）を毎回実施。PNG gAMA/sBIT 無視、丸め ε、RGB/BGR を統一。失敗したら評価修正が完了するまで学習は回さない。
+- 単視点オーバーフィットで PSNR ≥ 30 dB を達成するまで他調整は禁止。色のみ、深度/αは無効もしくは極弱・遅延。view-independent 小領域で確実に当てる。達成できなければ容量（hidden/skip/ Fourier L）→σ初期化（負バイアス強化）→学習率/バッチ→サンプル密度の順で見直し。
+
+**P1: α/深度の「遅く・弱く・滑らかに」**
+- αガードは連続 K ステップ未達（EMA 判定）でのみ増加。増分は +0.002/step 相当、減少はその半分。有効重み上限を 0.12〜0.15 に固定し、αガードペナルティ分位（P90 ≤ 0.07 / P99 ≤ 0.10）を監視指標にする。
+- 深度ロスは前景限定＋Huber 幅拡大。α 積分しきい値 0.7〜0.8、色が下がってから段階投入。深度 weight 微下げ × しきい値引き上げの 2×2 を 10K 短期で比較。
+
+**P2: view-dependent 成分の扱い**
+- dirL=2/4/6 を 10K ×3 本で比較。評価軸は終盤 1K color 平均・前景 PSNR・α スパイク頻度。改善 <5% またはスパイク悪化なら低 L へ戻す。方向ブランチは遅延ウォームアップ。
+
+**P3: サンプリングと透過率**
+- 透過率ヒストグラムを定点ロギング（序盤薄く・終盤締まる形）。サンプル数は前半軽・後半濃の漸増設計。near/far を再点検し遠景リークを抑える。σ バイアスは負維持、shifted-softplus 継続。
+
+**P4: 早期停止と重み集約**
+- 22K〜28K を重点保存し EMA / SWA を比較。loss/total の反発兆候や α P95 の上昇が見えたら延伸せず終了。v11 で 25K 谷だった観測と整合させる。
+
+**P5: 特徴蒸留再導入ゲート**
+- GO 条件: 単視点 30 dB、10K/20K で loss/total 非増、color ≲ 0.06、α スパイク ≤ 2%。比較空間は教師 52→64 / 生徒 64→64。cos → L2 の順で、小さな重みから。projector LR は生徒の ≤0.5 とし、安定後は凍結検討。導入は短縮ランで健全性確認後に 10K → 20K へ。
+
+**P6: ログ/診断の三本柱**
+- 損失別勾配ノルム比（color:α:depth:dir）、透過率ヒストグラム、worst-N 可視化を常時保存。必要に応じて CKA で特徴整合を確認し、projector 凍結判断に活用。
+
+**P7: tri/di-linear 混合（セル境界対策）**
+- 応答蒸留が安定してから 10K 短縮でオン/オフ比較。連続性向上とディテール鈍化のトレードを見極める。効果が薄いなら学習後期のみ有効化を検討。
+
+### 48 時間ミニ計画（言葉のみの段取り）
+- Day1 午前: P0 完了（自己一致テスト、単視点 30 dB）。
+- Day1 午後: P1 調整（α ガード頻度制御 + 深度前景化）を 10K × 2–3 本。
+- Day2 午前: P2 dirL=2/4/6 の 10K × 3 本。評価軸は color 終盤平均 + 前景 PSNR + α スパイク頻度。
+- Day2 午後: 勝ち設定を 20K へスケールし、22–28K 窓で早期停止をテスト（EMA / SWA 比較）。
+- 条件クリア後: P5 に沿って特徴蒸留を段階導入（短縮 → 10K → 20K）。
+
+### 合格ゲート（再確認）
+- 単視点（linear/straight α/EMA）: PSNR ≥ 30 dB。
+- 10K: loss/total 非増、color 単調減、α P90 ≤ 0.07 / P99 ≤ 0.10。
+- 20K: 前景 PSNR が白背景 PSNR を上回り、LPIPS が 0.20 台前半に接近。
+- 特徴再導入: 上記条件を満たしてから cos → L2 を小さな重みで導入。
+
+### 落とし穴チェック
+- pre-multiplied 混入、PIL と OpenCV の色変換差、PNG メタの残存。
+- フレーム順 / カメラ JSON の参照ずれ。
+- EMA 未適用での評価実施。
+- projector が動き続け基準が揺れる（早期凍結で防止）。
+
+この優先順位で短期ランを積み、評価由来の頭打ち → α/深度の反発 → 方向・特徴での上積み、の順で改善幅を作る。
+
+#### 2025-10-25 単視点オーバーフィット調査ログ
+
+- self-consistency (teacher vs teacher、200 frames) を再実行 → `psnr=∞ / ssim=1 / lpips=0` を確認し、評価パイプラインの linear/straight α 設定は健全。
+- 既存 `lego_single_view_overfit_v1/v2`・`simple` で 10k step まで回しても PSNR ≈ 6.6 dB 止まり。PNG を確認すると学生レンダは全画素が `[1,1,1]`（白背景のみ）で、密度ゼロのまま進んでいないことが判明。
+- 原因: α/opacity を完全に切ったため、shifted-softplus + 負バイアスが背景透過を維持し続け、色勾配が有効化されない。固定バッチ overfit（`--overfit-mode student`）も一部画素しか監督できず評価で白飛びが残った。
+- 対策: `lego_single_view_overfit_v3.yaml` を新設。σ バイアスを浅く（-0.2 / -0.4）しつつ、`loss.opacity` を弱い L1 で再導入（weight 0.05, target 0.25, max 0.25, warmup 400）。α guard は無効化。
+- v3 + overfit 固定バッチ (6k step) → PSNR 16.16 dB。色 loss は 0.0016 まで下がるものの、固定バッチのため未監督ピクセルが白背景のまま（平均 PSNR はまだ不足）。
+- 現在: 同じ v3 設定で **ランダムサンプリング 20k step** を走行中（`batch_size=16384`, `samples_per_ray=128`）。全画素に監督が行き渡るか、PSNR をモニタしながら 30 dB 目標の達成可否を確認する。トレーニングログは `logs/lego/single_view_overfit_v3/` に追記中。
+
 ## 2025-10-23 — 特徴蒸留v11 デバッグランと TensorBoard 指標整理
 
 * `distill/lego_response_distill.py` の TensorBoard 出力を整理。`full=True` で記録するスカラーを `loss/color`, `loss/opacity`, `loss/depth`, `loss/feature_recon`, `loss/feature_cosine`, `opacity/alpha_guard_penalty`, `opacity/target_weight_effective` の計 7 本へ縮小。
@@ -328,6 +399,30 @@ tensorboard --logdir tmp/tb_scalar_debug/logs/tensorboard --port 6006
 ---
 
 ## 2025-10-21 — TensorBoard スカラー復旧後の確認ログ
+
+## 2025-10-26 — 単視点オーバーフィットv3 20kラン解析
+
+* 評価パイプライン: `tools/evaluate_student_metrics.py` の linear RGB + straight α + 前景 PSNR が自己一致テストで確認済み。教師 vs 教師で `psnr=∞ / ssim=1 / lpips=0` が得られる。
+* 実験設定: `configs/generated/lego_single_view_overfit_v3.yaml`（`sigma_bias=-0.2`, `density_bias=-0.4`, `loss.opacity` L1 0.05 / target 0.25, α guard 無効）。`batch_size=16384`, `samples_per_ray=128`, ランダムサンプリングで 20k step まで実行。
+* メトリクス: `metrics_white.json` より `psnr=17.28 / ssim=0.758 / lpips=0.423 / psnr_foreground=17.28`。6k 固定バッチランの 16.2 dB から伸びたが 30 dB 目標には届かず。
+* ログ観察: `color` loss が step ≈2000 で 0.006 まで低下後、12k 以降 0.0021 付近で停滞。`learning_rate` が 20k まで 1.0e-3 一定で、`lr_schedule_steps=6000` が 20k 延伸に追従していないことを確認。`opacity_target` は 0.006→0.013 まで減少し、実効的に低不透明度を強く要求している。
+* 画像診断: α 平均 0.55 だが背景領域の MSE が 0.55 と高く、白背景に近い領域での誤差が PSNR を押し下げている。前景のみの PSNR は 16 dB 程度で改善余地あり。
+* アクション案:
+  1. `train.lr_schedule_steps` を 20000 に合わせ、ウォームアップ後の LR を 5e-4 前後まで減衰させて微調整フェーズを確保する。
+  2. `loss.opacity` の target/weight を再調整（例: target 0.2 付近へ引き戻し、`target_weight_base` の減衰を抑制）し、色収束の足かせになっている過剰な透明化圧を緩める。
+  3. それでも頭打ちなら hidden_dim を 96 以上に拡張、あるいは LR 減衰後に 60k step まで延伸して高周波フィットを試す。
+* v13 との位置付け: マルチビュー/特徴蒸留（v13 系）の前に、単視点で 30 dB を安定達成できる最小学生構成を確立する段階。単視点サニティが固まるまで v13 のハイパラ探索は保留。
+* 次タスク: 上記アクションを反映した v4 コンフィグ作成、再ランの前に自己一致テストを再実施、改善後の `metrics_summary.csv` を更新。
+* 2025-10-26 14:10 JST: `configs/generated/lego_single_view_overfit_v4.yaml` を追加。`max_steps=20000` / `lr_schedule_steps=20000` / `lr_schedule_min_lr=5e-4` でコサイン減衰を 20k ステップ全域に適用し、`loss.opacity` の target を 0.20・weight を 0.12 へ緩やかに立ち上げる設定に変更。評価前に self-consistency を再確認してから v4 ランを実行する。
+* 実行テンプレ: 単視点 v4 を走らせる前に旧成果物削除→TensorBoard 起動→学習開始の順で下記を実行。
+
+  ```bash
+  cd /mnt/d/imaizumi/kilogs
+  rm -rf logs/lego/single_view_overfit_v4 results/lego/single_view_overfit_v4
+  mkdir -p logs/lego/single_view_overfit_v4/tensorboard
+  conda run -n kilogs tensorboard --logdir logs/lego/single_view_overfit_v4/tensorboard --host 127.0.0.1 --port 6006
+  PYTHONHASHSEED=2025 CUBLAS_WORKSPACE_CONFIG=:4096:8 conda run -n kilogs python -m distill.lego_response_distill --config configs/generated/lego_single_view_overfit_v4.yaml
+  ```
 
 **進捗メモ**
 
