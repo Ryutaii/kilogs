@@ -16,6 +16,15 @@ Stable, reproducible pipeline for rendering & evaluating student vs teacher on *
 *備忘*: コード内のコメントや手元メモはすべて日本語で記載する。英語コメントは避ける。
 ---
 
+## 2025-10-27 — 単視点 v5 50K ラン実績
+
+* 事前処理: `rm -rf logs/lego/single_view_overfit_v5 results/lego/single_view_overfit_v5` → `conda run -n kilogs tensorboard --logdir logs/lego/single_view_overfit_v5/tensorboard --host 127.0.0.1 --port 6006` を実施してログをリセットしモニタを起動。
+* 50K ラン: `PYTHONHASHSEED=2025 CUBLAS_WORKSPACE_CONFIG=:4096:8 conda run -n kilogs python -m distill.lego_response_distill --config configs/generated/lego_single_view_overfit_v5.yaml` で Canonical KiloNeRF 構造（hidden_dim 64 / 2 層）を維持したまま学習ステップを 50K まで延伸。
+* レンダ & 評価: `render_student` で `step_050000.pth` を 1 フレーム出力（保存先 `results/lego/single_view_overfit_v5/eval_single_view_step050000_view000/`、avg_fps ≈0.31・GPU peak ≈1.18 GiB）。その後 `tools/evaluate_student_metrics.py results/.../renders/renders teacher/outputs/lego/test_white/ours_30000/renders --background white --render-stats ... --output-json ... --summary metrics_summary.csv --method-name single_view_overfit_v5_step050000_view000 --force-update` を実行し、白背景/前景 PSNR=18.00 dB, SSIM=0.760, LPIPS=0.427 を記録 (`metrics_white.json` + `metrics_summary.csv` 更新)。
+* 所感と次候補: v4 (PSNR 18.31) からの伸びはなく 18 dB で頭打ち。opacity map が薄めなため (a) opacity target を 0.16 前後へ緩和、(b) min lr を 5e-5 まで下げ後半の収束を強める、(c) 60K まで延長、などを候補に再調整する。レンダ結果の opacity/depth マップを確認して次の config 設計に反映する。
+
+---
+
 ## 2025-10-26 — 単視点オーバーフィット v5 ハイパラ計画
 
 * 目標: 単視点 response の白背景 PSNR を 20 dB 台に乗せる。KiloNeRF 既存構造（hidden_dim 64 / num_layers 2 / grid 2×18×10）を維持したまま、学習ステップとスケジュールで底上げする。
@@ -45,9 +54,14 @@ Stable, reproducible pipeline for rendering & evaluating student vs teacher on *
     --max-frames 1 --store-rgba
 
   conda run -n kilogs python tools/evaluate_student_metrics.py \
-    --student results/lego/single_view_overfit_v5/eval_single_view_step050000_view000 \
-    --background white --summary-csv metrics_summary.csv \
-    --method single_view_overfit_v5_step050000_view000 --force-update
+    results/lego/single_view_overfit_v5/eval_single_view_step050000_view000/renders/renders \
+    teacher/outputs/lego/test_white/ours_30000/renders \
+    --background white \
+    --render-stats results/lego/single_view_overfit_v5/eval_single_view_step050000_view000/render_stats.json \
+    --output-json results/lego/single_view_overfit_v5/eval_single_view_step050000_view000/metrics_white.json \
+    --summary metrics_summary.csv \
+    --method-name single_view_overfit_v5_step050000_view000 \
+    --force-update
   ```
 
 * 期待観測: color loss が 1e-3 台前半まで低下し、opacity map が v4 より滑らかかつ過度に締まりすぎないこと。PSNR≧20 dB に達すれば、次段階で depth ロス（>0）や dir エンコーディングを小さく導入する。未達の場合は 1) opacity target を 0.16 前後まで下げる、2) lr decay の底 (min lr) を 5e-5 へ下げる、3) 50K 以降も plateau なら 60K ステップ延長を検討する。
