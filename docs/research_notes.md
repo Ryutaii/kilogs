@@ -424,6 +424,52 @@ tensorboard --logdir tmp/tb_scalar_debug/logs/tensorboard --port 6006
   PYTHONHASHSEED=2025 CUBLAS_WORKSPACE_CONFIG=:4096:8 conda run -n kilogs python -m distill.lego_response_distill --config configs/generated/lego_single_view_overfit_v4.yaml
   ```
 
+* `step_020000.pth` 評価: `render_student.py --max-frames 1 --store-rgba` で 1 フレームのみレンダ（デフォルトだと 36 フレーム全てを吐き、平均 PSNR が 7 dB 台に落ちるので注意）。
+  ```bash
+  conda run -n kilogs python -m distill.render_student \
+    --config configs/generated/lego_single_view_overfit_v4.yaml \
+    --checkpoint results/lego/single_view_overfit_v4/checkpoints/step_020000.pth \
+    --output-dir results/lego/single_view_overfit_v4/eval_single_view_step020000_view000 \
+    --max-frames 1 --store-rgba
+
+  conda run -n kilogs python tools/evaluate_student_metrics.py \
+    results/lego/single_view_overfit_v4/eval_single_view_step020000_view000/renders/renders \
+    teacher/outputs/lego/test_white/ours_30000/renders \
+    --output-json results/lego/single_view_overfit_v4/eval_single_view_step020000_view000/metrics_white.json
+  ```
+  現状の指標は `PSNR 18.31 / SSIM 0.762 / LPIPS 0.421`（前景 PSNR 同値）。
+
+### フェーズ別検証ポリシー（2025-10-26 夕方）
+
+1. **単視点 × 応答蒸留のみ** — 評価パイプラインの健全性と基礎挙動を確認。目標 PSNR は 30 dB を上限目安としつつ、どこで頭打ちになるか（例: 20 dB 台後半）を把握する。
+2. **単視点 × 応答＋特徴蒸留** — 特徴ブランチでどこまでギャップを埋められるかを測り、feature schedule や projector 設定の初期値を固める。
+3. **多視点 × 応答蒸留** — カメラ分布・サンプリング・LR 等を多視点向けに再調整し、単視点で得た最適化がどこまで通用するか確認。問題が出たら差分を切り分ける。
+4. **多視点 × 応答＋特徴蒸留** — 仕上げフェーズ。上記 1〜3 の知見を統合し、ガウシアン→MLP の構造ギャップを特徴蒸留で埋める。本番評価・報告用。
+
+各フェーズごとに評価メトリクス（PSNR/SSIM/LPIPS/前景 PSNR）とログ変化をまとめ、次フェーズに進む際は差分の根拠（例: opacity 圧の変更、feature schedule の有無）を記録すること。
+
+#### 2025-10-26 単視点 v4 応答蒸留ランまとめ
+
+* 設定: `lego_single_view_overfit_v4.yaml`（LR cosine 20k, opacity target 0.20）。`train.max_steps=20000`、`batch=16384`、`samples_per_ray=128`。
+* ログ所感: `loss/color` が 2k step で 0.006 → 12k 以降 0.002 付近に停滞。`opacity` 平均 0.027。plateau 以降は LR 減衰を強める必要あり。
+* 評価テンプレ（1 フレームのみレンダすること）:
+
+  ```bash
+  conda run -n kilogs python -m distill.render_student \
+    --config configs/generated/lego_single_view_overfit_v4.yaml \
+    --checkpoint results/lego/single_view_overfit_v4/checkpoints/step_020000.pth \
+    --output-dir results/lego/single_view_overfit_v4/eval_single_view_step020000_view000 \
+    --max-frames 1 --store-rgba
+
+  conda run -n kilogs python tools/evaluate_student_metrics.py \
+    results/lego/single_view_overfit_v4/eval_single_view_step020000_view000/renders/renders \
+    teacher/outputs/lego/test_white/ours_30000/renders \
+    --output-json results/lego/single_view_overfit_v4/eval_single_view_step020000_view000/metrics_white.json
+  ```
+
+* 現在値: PSNR 18.31 / SSIM 0.762 / LPIPS 0.421。v3(PSNR 17.28) と比較して僅かに改善。単視点応答のみの上限としてログし、次は「LR 減衰強化」「opacity ターゲット再調整」「学生容量微増」の順で追加スイープ予定。
+* 注意: `render_student` のデフォルトは全テストビュー (36 枚) レンダするため、`--max-frames 1` を必ず指定。複数枚を平均すると PSNR が 7 dB 程度まで落ち込む誤差要因になる。
+
 **進捗メモ**
 
 * `distill/lego_response_distill.py` 修正後に 4 step ランを再実行し、`loss/total`, `loss/color`, `loss/opacity` など全てのスカラーがステップ 1〜4 で折れ線として描画されることを TensorBoard で確認。
