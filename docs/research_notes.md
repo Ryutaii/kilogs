@@ -14,6 +14,43 @@ Stable, reproducible pipeline for rendering & evaluating student vs teacher on *
 
 *備忘*: デバッグや再実行の前に必ず `conda activate kilogs` を実行し、環境が有効化されていることを確認する。
 *備忘*: コード内のコメントや手元メモはすべて日本語で記載する。英語コメントは避ける。
+---
+
+## 2025-10-26 — 単視点オーバーフィット v5 ハイパラ計画
+
+* 目標: 単視点 response の白背景 PSNR を 20 dB 台に乗せる。KiloNeRF 既存構造（hidden_dim 64 / num_layers 2 / grid 2×18×10）を維持したまま、学習ステップとスケジュールで底上げする。
+* 新規コンフィグ: `configs/generated/lego_single_view_overfit_v5.yaml`（50K step 伸長版）を一本化。lr 1e-3 → cosine 50K / min lr 1e-4、warmup 2K。opacity target 0.18・max 0.16、EMA 0.9997。v4 のパラメータ構成を踏襲しつつ、長期ランの安定化のみを追加した。
+* ラン順案: 1) 50K ランを実行し、30K/40K/50K チェックポイントで color loss と PSNR をモニタ。2) 50K checkpoint を `render_student` → `evaluate_student_metrics` の順で評価し、PSNR 20 dB 到達を確認。3) 伸びが不足する場合は opacity target を 0.16 付近へ再調整 or min lr を 5e-5 へ下げる案を次候補にする。
+* 実行前処理: 既存ログ/出力の削除と TensorBoard の起動は以下で統一。
+
+  ```bash
+  rm -rf logs/lego/single_view_overfit_v5 results/lego/single_view_overfit_v5
+
+  conda run -n kilogs tensorboard \
+    --logdir logs/lego/single_view_overfit_v5/tensorboard \
+    --host 127.0.0.1 --port 6006
+  ```
+* 実行テンプレ:
+
+  ```bash
+  PYTHONHASHSEED=2025 \
+  conda run -n kilogs python -m distill.lego_response_distill \
+    --config configs/generated/lego_single_view_overfit_v5.yaml
+
+  PYTHONHASHSEED=2025 \
+  conda run -n kilogs python -m distill.render_student \
+    --config configs/generated/lego_single_view_overfit_v5.yaml \
+    --checkpoint results/lego/single_view_overfit_v5/checkpoints/step_050000.pth \
+    --output-dir results/lego/single_view_overfit_v5/eval_single_view_step050000_view000 \
+    --max-frames 1 --store-rgba
+
+  conda run -n kilogs python tools/evaluate_student_metrics.py \
+    --student results/lego/single_view_overfit_v5/eval_single_view_step050000_view000 \
+    --background white --summary-csv metrics_summary.csv \
+    --method single_view_overfit_v5_step050000_view000 --force-update
+  ```
+
+* 期待観測: color loss が 1e-3 台前半まで低下し、opacity map が v4 より滑らかかつ過度に締まりすぎないこと。PSNR≧20 dB に達すれば、次段階で depth ロス（>0）や dir エンコーディングを小さく導入する。未達の場合は 1) opacity target を 0.16 前後まで下げる、2) lr decay の底 (min lr) を 5e-5 へ下げる、3) 50K 以降も plateau なら 60K ステップ延長を検討する。
 
 ---
 
