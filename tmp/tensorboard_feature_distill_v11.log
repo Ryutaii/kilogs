@@ -7,7 +7,10 @@ NOTE: Using experimental fast data loading logic. To disable, pass
     "--load_fast=false" and report issues on GitHub. More details:
     https://github.com/tensorflow/tensorboard/issues/4784
 
-E1023 22:09:37.865687 134315961386816 program.py:300] TensorBoard could not bind to port 6006, it was already in use
+TensorBoard 2.20.0 at http://127.0.0.1:6006/ (Press CTRL+C to quit)
+TensorBoard caught SIGTERM; exiting...
+
+y in use
 ERROR: TensorBoard could not bind to port 6006, it was already in use
 
 ERROR conda.cli.main_run:execute(127): `conda run tensorboard --logdir logs/lego/feat_t_full/runs/feature_distill_v11_debug10k/tensorboard --host 127.0.0.1 --port 6006` failed. (See above for error)

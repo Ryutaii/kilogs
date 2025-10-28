@@ -1,0 +1,106 @@
+experiment:
+  name: single_view_overfit_v7
+  seed: 2025
+  output_dir: results/lego/single_view_overfit_v7
+  progress_desc: 単視点オーバーフィットv7
+
+data:
+  dataset_root: ../3dgs/data/nerf_synthetic/lego
+  teacher_outputs: teacher/outputs/lego/test_white/ours_30000
+  teacher_depth_dir: teacher/outputs/lego/test_white/ours_30000/depth
+  camera_json: teacher/outputs/lego/test_white/ours_30000/transforms_test_white.json
+  background_color: [1.0, 1.0, 1.0]
+  batch_size: 16384
+  ray_chunk: 8192
+  near: 2.0
+  far: 6.0
+  samples_per_ray: 160
+  bbox_min: [-1.5, -1.5, -1.5]
+  bbox_max: [1.5, 1.5, 1.5]
+  perturb: false
+  max_frames: 1
+  frame_indices: [0]
+
+teacher:
+  type: gaussian_splatting
+  checkpoint: teacher/checkpoints/lego/point_cloud/iteration_30000/point_cloud.ply
+  render_stats: teacher/outputs/lego/test_white/ours_30000/render_stats.json
+
+student:
+  type: kilo_uniform_mlp
+  grid_resolution: [2, 18, 10]
+  hidden_dim: 64
+  num_layers: 2
+  activation: relu
+  pos_encoding: fourier
+  pos_L: 12
+  dir_encoding: none
+  dir_L: 0
+  skips: [2]
+  sigma_activation: shifted_softplus
+  sigma_bias: -0.18
+  density_bias: -0.32
+  color_bias: 0.0
+  regularization_weight: 0.0
+  enable_boundary_blend: false
+
+train:
+  max_steps: 52000
+  phases:
+    - name: single_view
+      end_step: 52000
+      optimize: [student]
+  eval_interval: 2500
+  checkpoint_interval: 10000
+  lr: 1.0e-3
+  lr_schedule: cosine
+  lr_schedule_steps: 50000
+  lr_schedule_min_lr: 2.0e-5
+  lr_warmup_steps: 2000
+  gradient_clip_norm: 1.0
+  ema_decay: 0.9998
+  promotion_gates: false
+
+loss:
+  color:
+    type: charbonnier
+    weight: 1.0
+    eps: 1.0e-3
+    secondary_type: l2
+    secondary_weight: 0.25
+    secondary_eps: 1.0e-3
+  opacity:
+    type: l1
+    weight: 0.045
+    target: 0.21
+    target_weight: 0.12
+    start_weight: 0.04
+    warmup_steps: 2200
+    schedule: cosine
+    schedule_duration: 12000
+    background_threshold: 0.04
+    max_weight: 0.22
+    mean_target: 0.32
+    mean_weight: 0.02
+  depth:
+    type: smooth_l1
+    weight: 0.0
+    alpha_threshold: 0.7
+  feature_l2:
+    weight: 0.0
+  feature_cos:
+    weight: 0.0
+  alpha_guard:
+    enabled: false
+
+feature_pipeline:
+  enabled: false
+
+logging:
+  tensorboard: logs/lego/single_view_overfit_v7/tensorboard
+  csv: logs/lego/single_view_overfit_v7/training_metrics.csv
+  render_preview_interval: 1500
+  log_interval: 20
+  tensorboard_flush_secs: 10
+
+background: masked_white

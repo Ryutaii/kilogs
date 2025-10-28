@@ -88,6 +88,19 @@ Stable, reproducible pipeline for rendering & evaluating student vs teacher on *
 * 終了後 TODO: `results/lego/single_view_overfit_v7/checkpoints/step_052000.pth` を `render_student.py` + `evaluate_student_metrics.py` へ回し、白背景/前景 PSNR・α ヒストグラムを記録。
 * メモ: `max_steps=52000` は v6 tail から踏襲。cosine LR を 50K で最小学習率へ落とし切ったあと、低 LR のまま 2K ステップ延長して α 監視と Charbonnier/L2 ブレンドの尾部収束を追うためのバッファ。
 
+## 2025-10-29 — 単視点 v7 振り返りと改善方針
+
+- step_052000 の白背景評価: PSNR 18.366 dB / SSIM 0.756 / LPIPS 0.424、前景 PSNR も同値。`metrics_summary.csv` と `results/lego/single_view_overfit_v7/eval_single_view_step052000_view000/metrics_white.json` に反映済み。
+- α 診断ログ: `alpha.halo_indicator≈0.29`, `alpha_halo_streak=8`, `alpha_guard_penalty≈0.098`, `alpha.p50_ray≈0.21`。ハロ継続フラグが立ちっぱなしで、背景が明るく膨張している。
+- v6_tail (PSNR 19.175 dB) 比較では、v7 で追加した `mean_target=0.32` / `mean_weight=0.02` と Charbonnier+L2 の長時間テールが α を過密化し、PSNR を 0.8 dB 以上落としたと推定。
+- `alpha_guard` を無効化したままだとペナルティ指標だけが高止まりするため、次ランでは軽量 guard を再び有効化して α 分布を抑制する必要がある。
+
+**次ラン (v8 案) の変更点**
+- `configs/generated/lego_single_view_overfit_v8.yaml` を作成予定。`loss.color.secondary_weight=0.10` に下げて L2 の影響を補助レベルへ調整。
+- `loss.opacity`: `target_weight=0.10`, `start_weight=0.035`, `max_weight=0.20`, `warmup_steps=2600`, `mean_target=0.24`, `mean_weight=0.008` とし、α 立ち上げを遅らせつつ平均値の押し上げを弱める。
+- `alpha_guard` を有効化 (`initial_weight=0.05`, `weight_floor=0.02`, `weight_cap=0.08`, `penalty_hi=0.20`, `penalty_lo=0.03`, `adjustment_smoothing=0.18`, `check_interval=200`) して過剰密度を自動的に抑制。
+- 学習率テールは v6_tail の実績を踏襲 (`lr_schedule_steps=45000`, `lr_schedule_min_lr=3.0e-5`, `max_steps=52000`)。監視目標: `alpha.p50_ray≤0.16`, `alpha_guard_penalty≤0.04`, `alpha.halo_indicator≤0.02`。
+
 **最新アドバイス反映 — 単視点 v5 改善ロードマップ（2025-10-27 夜時点）**
 
 1. **Run A（本命）** — *min lr を 5e-5 へ下げ*、*opacity target を 0.20〜0.22 へ微増*
