@@ -1396,15 +1396,15 @@ def _compute_patch_cosine_loss(
         return torch.zeros((), device=features.device, dtype=features.dtype)
 
     patches = working.unfold(0, patch_size, stride)
+    mask_patches: Optional[torch.Tensor] = None
     if patches.numel() == 0:
         patches = working.unsqueeze(0)
-        mask_patches = None
-    else:
-        mask_patches = None
         if mask_vector is not None:
-            mask_patches = mask_vector.unfold(0, patch_size, stride)
-            if mask_patches.numel() == 0:
-                mask_patches = mask_vector.unsqueeze(0)
+            mask_patches = mask_vector.unsqueeze(0)
+    elif mask_vector is not None:
+        mask_patches = mask_vector.unfold(0, patch_size, stride)
+        if mask_patches.numel() == 0:
+            mask_patches = mask_vector.unsqueeze(0)
 
     patch_weights: Optional[torch.Tensor] = None
     if mask_vector is not None and mask_patches is not None:
@@ -4000,6 +4000,56 @@ def train(
     alpha_guard_relax_streak = 0
     alpha_guard_last_direction: Optional[str] = None
 
+    try:
+        alpha_quantile_interval_env = os.getenv("KILOGS_ALPHA_QUANTILE_INTERVAL", "0") or "0"
+        alpha_quantile_interval_requested = int(alpha_quantile_interval_env)
+    except ValueError:
+        alpha_quantile_interval_requested = 0
+    alpha_quantile_interval = max(1, alpha_quantile_interval_requested or 1)
+    try:
+        alpha_quantile_sample_fraction = float(os.getenv("KILOGS_ALPHA_QUANTILE_SAMPLE_FRAC", "0.05"))
+    except ValueError:
+        alpha_quantile_sample_fraction = 0.05
+    alpha_quantile_sample_fraction = min(max(alpha_quantile_sample_fraction, 0.0), 1.0)
+    try:
+        alpha_quantile_min_samples = max(1, int(os.getenv("KILOGS_ALPHA_QUANTILE_MIN", "2048")))
+    except ValueError:
+        alpha_quantile_min_samples = 2048
+    try:
+        alpha_quantile_history_window = max(1, int(os.getenv("KILOGS_ALPHA_TAIL_WINDOW", "1000")))
+    except ValueError:
+        alpha_quantile_history_window = 1000
+    alpha_quantile_last_values: Dict[str, torch.Tensor] = {
+        "p50": torch.tensor(float("nan"), device=device),
+        "p90": torch.tensor(float("nan"), device=device),
+        "p99": torch.tensor(float("nan"), device=device),
+    }
+    alpha_quantile_last_refresh_step: Optional[int] = None
+    alpha_quantile_refresh_count = 0
+    alpha_quantile_nan_events = 0
+    alpha_quantile_history: Deque[Tuple[int, float]] = deque()
+    alpha_spread_last = torch.tensor(float("nan"), device=device)
+    alpha_tail_slope_last = torch.tensor(float("nan"), device=device)
+    if "KILOGS_ALPHA_LEAK_THRESHOLD" not in os.environ:
+        raise SystemExit("[alpha] Required env KILOGS_ALPHA_LEAK_THRESHOLD is unset. Export it before launch for reproducible leak diagnostics.")
+    if "KILOGS_ALPHA_HALO_THRESHOLD" not in os.environ:
+        raise SystemExit("[alpha] Required env KILOGS_ALPHA_HALO_THRESHOLD is unset. Export it before launch for reproducible halo diagnostics.")
+    try:
+        alpha_leak_threshold = float(os.environ["KILOGS_ALPHA_LEAK_THRESHOLD"])
+    except ValueError as err:
+        raise SystemExit("[alpha] KILOGS_ALPHA_LEAK_THRESHOLD must parse as float.") from err
+    try:
+        alpha_halo_threshold = float(os.environ["KILOGS_ALPHA_HALO_THRESHOLD"])
+    except ValueError as err:
+        raise SystemExit("[alpha] KILOGS_ALPHA_HALO_THRESHOLD must parse as float.") from err
+    try:
+        alpha_issue_streak_window = max(1, int(os.getenv("KILOGS_ALPHA_ISSUE_STREAK", "8")))
+    except ValueError:
+        alpha_issue_streak_window = 8
+    alpha_leak_streak = 0
+    alpha_halo_streak = 0
+    alpha_last_issue_code = 0
+
     mask_prefail_cfg = train_cfg.mask_prefail or MaskPrefailConfig()
     mask_prefail_window = max(4, int(mask_prefail_cfg.window))
     mask_prefail_enabled = bool(mask_prefail_cfg.enabled) and mask_controller is not None
@@ -4578,6 +4628,112 @@ def train(
         except Exception as err:
             progress.write(f"[logging] Failed to write bailout metrics CSV: {err}")
 
+    def _update_alpha_quantiles(
+        opacity_tensor: torch.Tensor,
+        *,
+        step: int,
+        force: bool = False,
+    ) -> None:
+        nonlocal alpha_quantile_last_refresh_step
+        nonlocal alpha_quantile_last_values
+        nonlocal alpha_quantile_refresh_count
+        nonlocal alpha_quantile_nan_events
+        nonlocal alpha_spread_last
+        nonlocal alpha_tail_slope_last
+        nonlocal alpha_quantile_history
+
+        if opacity_tensor is None or opacity_tensor.numel() == 0:
+            return
+
+        should_refresh = force
+        if not should_refresh:
+            if alpha_quantile_last_refresh_step is None:
+                should_refresh = True
+            else:
+                should_refresh = (step - alpha_quantile_last_refresh_step) >= alpha_quantile_interval
+        if not should_refresh and step <= start_step + 5:
+            should_refresh = True
+        if not should_refresh and step >= train_cfg.max_steps:
+            should_refresh = True
+        if not should_refresh:
+            return
+
+        success = False
+        with torch.no_grad():
+            try:
+                flat = opacity_tensor.detach().reshape(-1).to(dtype=torch.float32)
+                sample_count = flat.numel()
+                if sample_count == 0:
+                    raise RuntimeError("alpha tensor empty")
+                if alpha_quantile_sample_fraction > 0.0 and sample_count > alpha_quantile_min_samples:
+                    target = int(math.ceil(sample_count * alpha_quantile_sample_fraction))
+                    target = max(alpha_quantile_min_samples, target)
+                    target = min(target, sample_count)
+                    if target < sample_count:
+                        if target * 2 >= sample_count:
+                            indices = torch.randperm(sample_count, device=flat.device, dtype=torch.int64)[:target]
+                        else:
+                            indices = torch.randint(0, sample_count, (target,), device=flat.device, dtype=torch.int64)
+                        flat = flat.index_select(0, indices)
+                        sample_count = target
+                quantile_points = torch.tensor([0.50, 0.90, 0.99], device=flat.device, dtype=flat.dtype)
+                quantiles = torch.quantile(flat, quantile_points)
+                quantiles = torch.sort(torch.clamp(quantiles, min=0.0, max=1.0))[0]
+                if (
+                    hasattr(torch, "distributed")
+                    and torch.distributed.is_available()
+                    and torch.distributed.is_initialized()
+                ):
+                    reduced = quantiles.to(dtype=torch.float64)
+                    torch.distributed.all_reduce(reduced, op=torch.distributed.ReduceOp.SUM)
+                    world_size = torch.distributed.get_world_size()
+                    if world_size > 0:
+                        reduced = reduced / float(world_size)
+                    quantiles = reduced.to(dtype=opacity_tensor.dtype)
+                else:
+                    quantiles = quantiles.to(dtype=opacity_tensor.dtype)
+                p50, p90, p99 = quantiles
+                p90 = torch.maximum(p90, p50)
+                p99 = torch.maximum(p99, p90)
+                for value in (p50, p90, p99):
+                    if not torch.isfinite(value):
+                        raise RuntimeError("non-finite alpha quantile")
+                alpha_quantile_last_values = {
+                    "p50": p50.detach(),
+                    "p90": p90.detach(),
+                    "p99": p99.detach(),
+                }
+                alpha_quantile_last_refresh_step = step
+                alpha_quantile_refresh_count += 1
+                alpha_spread_last = torch.clamp(p99 - p50, min=0.0).detach()
+                alpha_quantile_history.append((step, float(p99.detach().cpu().item())))
+                while alpha_quantile_history and (step - alpha_quantile_history[0][0]) > alpha_quantile_history_window:
+                    alpha_quantile_history.popleft()
+                if len(alpha_quantile_history) >= 2:
+                    hist_start_step, hist_start_val = alpha_quantile_history[0]
+                    hist_end_step, hist_end_val = alpha_quantile_history[-1]
+                    denom = max(hist_end_step - hist_start_step, 1)
+                    slope_value = (hist_end_val - hist_start_val) / float(denom)
+                    alpha_tail_slope_last = torch.tensor(
+                        slope_value,
+                        device=device,
+                        dtype=opacity_tensor.dtype,
+                    )
+                else:
+                    alpha_tail_slope_last = torch.tensor(float("nan"), device=device, dtype=opacity_tensor.dtype)
+                success = True
+            except Exception as err:
+                debug_log(f"alpha_quantile_refresh_failed step={step} err={err}")
+        if not success:
+            alpha_quantile_nan_events += 1
+        else:
+            alpha_quantile_last_values = {
+                key: value.to(device=device, dtype=opacity_tensor.dtype)
+                for key, value in alpha_quantile_last_values.items()
+            }
+            alpha_spread_last = alpha_spread_last.to(device=device, dtype=opacity_tensor.dtype)
+            alpha_tail_slope_last = alpha_tail_slope_last.to(device=device, dtype=opacity_tensor.dtype)
+
     def update_moving_averages(metrics: Dict[str, torch.Tensor]) -> None:
         for base_key, avg_key, _ in moving_average_specs:
             buffer = moving_average_buffers.get(base_key)
@@ -5098,6 +5254,11 @@ def train(
         )
     )
 
+    if alpha_quantile_interval_requested > 0:
+        alpha_quantile_interval = max(1, alpha_quantile_interval_requested)
+    else:
+        alpha_quantile_interval = max(1, scalar_log_interval)
+
     abort_exc: Optional[TrainingAbort] = None
     try:
         while global_step < train_cfg.max_steps:
@@ -5294,31 +5455,6 @@ def train(
             alpha_fraction_ge95 = (student_sigma >= 0.95).float().mean()
             alpha_fraction_le05 = (student_sigma <= 0.05).float().mean()
             alpha_fraction_mid = torch.clamp(1.0 - alpha_fraction_ge95 - alpha_fraction_le05, 0.0, 1.0)
-            alpha_quantile_p50: torch.Tensor
-            alpha_quantile_p90: torch.Tensor
-            alpha_quantile_p99: torch.Tensor
-            if student_sigma.numel() > 0:
-                try:
-                    alpha_flat = student_sigma.reshape(-1)
-                    quantile_points = torch.tensor(
-                        [0.50, 0.90, 0.99],
-                        dtype=alpha_flat.dtype,
-                        device=alpha_flat.device,
-                    )
-                    alpha_quantiles = torch.quantile(alpha_flat, quantile_points)
-                    alpha_quantile_p50 = alpha_quantiles[0]
-                    alpha_quantile_p90 = alpha_quantiles[1]
-                    alpha_quantile_p99 = alpha_quantiles[2]
-                except RuntimeError:
-                    nan_tensor = torch.tensor(float("nan"), device=device, dtype=student_sigma.dtype)
-                    alpha_quantile_p50 = nan_tensor
-                    alpha_quantile_p90 = nan_tensor
-                    alpha_quantile_p99 = nan_tensor
-            else:
-                nan_tensor = torch.tensor(float("nan"), device=device, dtype=student_sigma.dtype)
-                alpha_quantile_p50 = nan_tensor
-                alpha_quantile_p90 = nan_tensor
-                alpha_quantile_p99 = nan_tensor
             alpha_band_core = (
                 torch.nn.functional.relu(alpha_mean_tensor - 0.45)
                 + torch.nn.functional.relu(0.35 - alpha_mean_tensor)
@@ -6038,6 +6174,67 @@ def train(
             if feature_aux_enabled and "feature_aux" not in loss_dict:
                 loss_dict["feature_aux"] = torch.zeros((), device=device)
     
+            total_loss_detached = total_loss.detach()
+            loss_is_finite = bool(torch.isfinite(total_loss_detached).item())
+            total_val = float(total_loss_detached.cpu().item()) if loss_is_finite else float("nan")
+
+            steps_since_start = max(global_step - start_step, 0)
+            should_log_interval = (steps_since_start % scalar_log_interval) == 0
+            warmup_span = max(1, min(scalar_log_interval, 5))
+            within_log_warmup = steps_since_start <= warmup_span
+            should_log_step = (
+                should_log_interval
+                or global_step in promotion_pending
+                or not loss_is_finite
+                or global_step == train_cfg.max_steps
+                or within_log_warmup
+            )
+            if scalar_log_interval <= 1:
+                should_log_interval = True
+                should_log_step = True
+
+            _update_alpha_quantiles(
+                student_sigma,
+                step=global_step,
+                force=should_log_step,
+            )
+
+            alpha_quantile_p50 = alpha_quantile_last_values["p50"]
+            alpha_quantile_p90 = alpha_quantile_last_values["p90"]
+            alpha_quantile_p99 = alpha_quantile_last_values["p99"]
+            alpha_spread_tensor = alpha_spread_last
+            alpha_tail_slope_tensor = alpha_tail_slope_last
+
+            # Leak/Halo heuristics (clamped to >=0 for interpretability).
+            leak_primary = torch.clamp(0.2 - alpha_quantile_p50, min=0.0)
+            leak_tail = torch.clamp(-alpha_tail_slope_tensor, min=0.0)
+            alpha_leak_indicator = (leak_primary + 0.5 * leak_tail).to(dtype=student_sigma.dtype)
+            halo_primary = torch.clamp(alpha_quantile_p99 - 0.985, min=0.0)
+            halo_spread = torch.clamp(alpha_spread_tensor - 0.25, min=0.0)
+            halo_tail = torch.clamp(alpha_tail_slope_tensor, min=0.0)
+            alpha_halo_indicator = (halo_primary + 0.5 * halo_spread + 0.25 * halo_tail).to(dtype=student_sigma.dtype)
+
+            leak_scalar = float(alpha_leak_indicator.detach().cpu().item()) if torch.isfinite(alpha_leak_indicator) else 0.0
+            halo_scalar = float(alpha_halo_indicator.detach().cpu().item()) if torch.isfinite(alpha_halo_indicator) else 0.0
+            if leak_scalar > alpha_leak_threshold:
+                alpha_leak_streak = min(alpha_leak_streak + 1, alpha_issue_streak_window)
+            else:
+                alpha_leak_streak = max(alpha_leak_streak - 1, 0)
+            if halo_scalar > alpha_halo_threshold:
+                alpha_halo_streak = min(alpha_halo_streak + 1, alpha_issue_streak_window)
+            else:
+                alpha_halo_streak = max(alpha_halo_streak - 1, 0)
+
+            issue_code = 0
+            issue_strength = 0.0
+            if alpha_leak_streak >= alpha_issue_streak_window and alpha_leak_streak >= alpha_halo_streak:
+                issue_code = 1
+                issue_strength = leak_scalar
+            elif alpha_halo_streak >= alpha_issue_streak_window and alpha_halo_streak > alpha_leak_streak:
+                issue_code = 2
+                issue_strength = halo_scalar
+            alpha_last_issue_code = issue_code if issue_code != 0 else alpha_last_issue_code
+
             if global_step <= start_step + 5:
                 debug_log("log_checkpoint_gate step=%s" % (global_step,))
             debug_log("checkpoint_metrics step=%s" % (global_step,))
@@ -6056,9 +6253,30 @@ def train(
             log_metrics["alpha_fraction_le05"] = alpha_fraction_le05.detach()
             log_metrics["alpha_fraction_mid"] = alpha_fraction_mid.detach()
             log_metrics["alpha_penalty_core"] = alpha_penalty_core.detach()
-            log_metrics["alpha_quantile_p50"] = alpha_quantile_p50.detach()
-            log_metrics["alpha_quantile_p90"] = alpha_quantile_p90.detach()
-            log_metrics["alpha_quantile_p99"] = alpha_quantile_p99.detach()
+            log_metrics["alpha.p50_ray"] = alpha_quantile_p50.detach()
+            log_metrics["alpha.p90_ray"] = alpha_quantile_p90.detach()
+            log_metrics["alpha.p99_ray"] = alpha_quantile_p99.detach()
+            log_metrics["alpha.spread"] = alpha_spread_tensor.detach()
+            log_metrics["alpha.tail_slope"] = alpha_tail_slope_tensor.detach()
+            log_metrics["alpha.quantile_refresh_count"] = torch.tensor(
+                float(alpha_quantile_refresh_count),
+                device=device,
+            )
+            log_metrics["alpha.quantile_nan_events"] = torch.tensor(
+                float(alpha_quantile_nan_events),
+                device=device,
+            )
+            # Backwards compatibility for in-flight dashboards expecting legacy keys.
+            log_metrics["alpha_quantile_p50"] = log_metrics["alpha.p50_ray"]
+            log_metrics["alpha_quantile_p90"] = log_metrics["alpha.p90_ray"]
+            log_metrics["alpha_quantile_p99"] = log_metrics["alpha.p99_ray"]
+            log_metrics["alpha.leak_indicator"] = alpha_leak_indicator.detach()
+            log_metrics["alpha.halo_indicator"] = alpha_halo_indicator.detach()
+            log_metrics["alpha.leak_streak"] = torch.tensor(float(alpha_leak_streak), device=device)
+            log_metrics["alpha.halo_streak"] = torch.tensor(float(alpha_halo_streak), device=device)
+            log_metrics["alpha.issue_code"] = torch.tensor(float(issue_code), device=device)
+            log_metrics["alpha.issue_strength"] = torch.tensor(float(issue_strength), device=device)
+            log_metrics.setdefault("alpha.issue_last", torch.tensor(float(alpha_last_issue_code), device=device))
             log_metrics["alpha_penalty_weight"] = torch.tensor(alpha_penalty_weight, device=device)
             log_metrics["alpha_guard_avg_penalty"] = torch.tensor(alpha_guard_avg_penalty, device=device)
             log_metrics["alpha_penalty_weight_target"] = torch.tensor(
@@ -6335,10 +6553,6 @@ def train(
             update_moving_averages(log_metrics)
             debug_log("after_moving_avg step=%s" % (global_step,))
     
-            total_loss_detached = total_loss.detach()
-            loss_is_finite = bool(torch.isfinite(total_loss_detached).item())
-            total_val = float(total_loss_detached.cpu().item()) if loss_is_finite else float("nan")
-    
             debug_log(
                 "log_before_csv step=%s finite=%s total=%s" % (
                     global_step,
@@ -6359,9 +6573,44 @@ def train(
             base_log_metrics["opacity_target_weight_base"] = torch.tensor(opacity_target_weight_base, device=device)
             base_log_metrics["opacity_target_adjustment"] = torch.tensor(opacity_target_adjustment, device=device)
             base_log_metrics["opacity_lambda_runtime"] = torch.tensor(opacity_lambda_runtime, device=device)
+            base_log_metrics.setdefault("alpha.p50_ray", alpha_quantile_p50.detach())
+            base_log_metrics.setdefault("alpha.p90_ray", alpha_quantile_p90.detach())
+            base_log_metrics.setdefault("alpha.p99_ray", alpha_quantile_p99.detach())
+            base_log_metrics.setdefault("alpha.spread", alpha_spread_last.detach())
+            base_log_metrics.setdefault("alpha.tail_slope", alpha_tail_slope_last.detach())
+            base_log_metrics.setdefault(
+                "alpha.quantile_refresh_count",
+                torch.tensor(float(alpha_quantile_refresh_count), device=device),
+            )
+            base_log_metrics.setdefault(
+                "alpha.quantile_nan_events",
+                torch.tensor(float(alpha_quantile_nan_events), device=device),
+            )
             base_log_metrics.setdefault("alpha_quantile_p50", alpha_quantile_p50.detach())
             base_log_metrics.setdefault("alpha_quantile_p90", alpha_quantile_p90.detach())
             base_log_metrics.setdefault("alpha_quantile_p99", alpha_quantile_p99.detach())
+            base_log_metrics.setdefault("alpha.leak_indicator", alpha_leak_indicator.detach())
+            base_log_metrics.setdefault("alpha.halo_indicator", alpha_halo_indicator.detach())
+            base_log_metrics.setdefault(
+                "alpha.leak_streak",
+                torch.tensor(float(alpha_leak_streak), device=device),
+            )
+            base_log_metrics.setdefault(
+                "alpha.halo_streak",
+                torch.tensor(float(alpha_halo_streak), device=device),
+            )
+            base_log_metrics.setdefault(
+                "alpha.issue_code",
+                torch.tensor(float(issue_code), device=device),
+            )
+            base_log_metrics.setdefault(
+                "alpha.issue_strength",
+                torch.tensor(float(issue_strength), device=device),
+            )
+            base_log_metrics.setdefault(
+                "alpha.issue_last",
+                torch.tensor(float(alpha_last_issue_code), device=device),
+            )
     
             metrics_floats_for_log = write_metrics_csv(global_step, total_val, base_log_metrics)
             metrics_floats_for_tb = dict(metrics_floats_for_log)
@@ -6399,20 +6648,6 @@ def train(
                     start_step,
                 )
             )
-            steps_since_start = max(global_step - start_step, 0)
-            should_log_interval = (steps_since_start % scalar_log_interval) == 0
-            warmup_span = max(1, min(scalar_log_interval, 5))
-            within_log_warmup = steps_since_start <= warmup_span
-            should_log_step = (
-                should_log_interval
-                or global_step in promotion_pending
-                or not loss_is_finite
-                or global_step == train_cfg.max_steps
-                or within_log_warmup
-            )
-            if scalar_log_interval <= 1:
-                should_log_interval = True
-                should_log_step = True
             debug_window_limit = start_step + max(200, scalar_log_interval * 4)
             if global_step <= debug_window_limit:
                 debug_log(

@@ -68,6 +68,141 @@ Stable, reproducible pipeline for rendering & evaluating student vs teacher on *
 
 ---
 
+## 2025-10-28 — 単視点オーバーフィット v7 実行テンプレ
+
+* 事前処理: `rm -rf logs/lego/single_view_overfit_v7 results/lego/single_view_overfit_v7` → `tensorboard --logdir logs/lego/single_view_overfit_v7/tensorboard --host 127.0.0.1 --port 6006` を別ターミナルで起動。
+* 必須環境変数: `PYTHONHASHSEED=2025`, `CUBLAS_WORKSPACE_CONFIG=:4096:8`, `KILOGS_ALPHA_LEAK_THRESHOLD=0.015`, `KILOGS_ALPHA_HALO_THRESHOLD=0.015`, `PYTHONPATH=.`（どれか欠けると `lego_response_distill.py` が即時終了する）。
+* 実行テンプレ:
+
+  ```bash
+  PYTHONHASHSEED=2025 \
+  CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+  KILOGS_ALPHA_LEAK_THRESHOLD=0.015 \
+  KILOGS_ALPHA_HALO_THRESHOLD=0.015 \
+  PYTHONPATH=. \
+  python distill/lego_response_distill.py \
+    --config configs/generated/lego_single_view_overfit_v7.yaml
+  ```
+
+* 監視ポイント: `logs/lego/single_view_overfit_v7/tensorboard` の α 分位 (`alpha_quantile/*`), リーク/ハロ指標 (`alpha_diag/leak_flag`, `alpha_diag/halo_flag`), `loss/color`, `loss/opacity`, `opacity/target_weight_effective`。
+* 終了後 TODO: `results/lego/single_view_overfit_v7/checkpoints/step_052000.pth` を `render_student.py` + `evaluate_student_metrics.py` へ回し、白背景/前景 PSNR・α ヒストグラムを記録。
+* メモ: `max_steps=52000` は v6 tail から踏襲。cosine LR を 50K で最小学習率へ落とし切ったあと、低 LR のまま 2K ステップ延長して α 監視と Charbonnier/L2 ブレンドの尾部収束を追うためのバッファ。
+
+**最新アドバイス反映 — 単視点 v5 改善ロードマップ（2025-10-27 夜時点）**
+
+1. **Run A（本命）** — *min lr を 5e-5 へ下げ*、*opacity target を 0.20〜0.22 へ微増*
+  - 目的: 終盤の微分余地を確保しつつ背景リークを抑えて PSNR を押し上げる。
+  - Go判定: 40K→50K で color loss が再び減少し、白背景 PSNR が +0.5 dB 以上伸び、前景 PSNR ≥ 白 PSNR。
+  - No-Go: color が横ばいで α ヒストグラムが薄いまま or 背景誤差支配が継続。
+
+2. **Run B（切り分け対照）** — *min lr を 5e-5 に統一*しつつ、opacity target は現状の 0.18 を維持
+  - 目的: Run A の改善が α 目標の調整によるものか、min lr 自体の効果かを切り分ける。
+  - 判定: Run A が伸びて Run B が伸びない → α 上げが効いている。両方ダメなら α 緩和（0.16〜0.18）＋ warmup 延長を検討。
+
+3. **α 調整の両極を確認**
+  - 背景 MSE 高め / α 平均低め（透け多い）→ α ターゲットを上げる方向。
+  - 縁のハロ・スパイク目立つ / α ガードが暴れている → α ターゲットを下げつつ立ち上げ遅延。
+
+4. **Go 条件が見えたら 60K 延長**
+  - “min lr の尻が効いて伸びた”と確認できた設定のみ 60K へ延長。伸びが無いまま延長しない。
+
+5. **代替/強化オプション**（上記と組み合わせ可能）
+  - 終盤のみ samples_per_ray を増やす（高周波拾いで +0.3〜0.7 dB 期待）。
+  - σ バイアスを浅くして初期密度を出やすく（薄すぎる場合）。
+  - hidden_dim を 80〜96 へ微増（層数は据え置き）— 30 dB を狙う際の保険。
+  - EMA をさらに重く or SWA 併用で評価ノイズを低減。
+  - 色損失に微量 Charbonnier/L1 を混ぜ、PSNR 目的 MSE の停滞を緩める。
+
+6. **実行前チェックリスト**
+  - 前景 PSNR vs 白 PSNR（背景誤差支配を把握）。
+  - α ヒストグラム（平均 / P90 / P99、薄いかスパイクか）。
+  - color loss の推移（30K 以降で微減が続くか）。
+  - EMA 評価とのズレ有無（ノイズが残っていないか）。
+
+**次の一手（即実行）**
+- Run A 用として `configs/generated/lego_single_view_overfit_v6.yaml` を作成（min lr=5e-5, opacity target=0.21, max_weight=0.22 などを反映）。
+- Run B 用として `configs/generated/lego_single_view_overfit_v6_ablation.yaml` を用意（opacity target=0.18 を維持しつつ min lr=5e-5 に揃えた比較設定）。
+- それぞれ 50K ランを走らせ、30K/40K/50K の color と PSNR、α 分布を比較。Run A が +0.5 dB 以上伸びれば同設定を 60K 延長、伸びなければ α 緩和・サンプル増しのセットに移行。
+
+**30K / 40K / 50K の観測ポイント**
+- ⚑ *Green*: color loss が微減を継続（特に 40K→50K で再下降）、前景 PSNR ≥ 白 PSNR、α ヒストグラム中央値が過度に上がらず P95≲0.9 で安定、α ガード分布が P90≤0.07 / P99≤0.10。
+- ⚠ *Red*: 35K 以降 color が完全横ばい、白 PSNR が前景を上回る、α 平均が低く透ける or P99 が張り付いてハロが出る。
+
+**微調整ノブ（優先順）**
+1. Run A のまま: 45K 停滞なら min lr→3e-5 テール強化、α が薄ければ target を +0.01、縁が固いなら warmup を延長して立ち上がり遅延。
+
+  **Run A/B 50K 結果（2025-10-27）**
+  - Run A (`lego_single_view_overfit_v6`): PSNR 18.32 dB, SSIM 0.756, LPIPS 0.427。α ターゲットを 0.21→`target_weight_effective` 0.12 に乗せたことで背景リークは減少し、前景/白背景とも 18.32 dB まで改善。
+  - Run B (`lego_single_view_overfit_v6_ablation`): PSNR 18.00 dB, SSIM 0.760, LPIPS 0.427。α ターゲット 0.18 のままでは v5 相当から伸びず、color loss も 0.137 付近で頭打ち。
+  - どちらも GPU peak ≈1.18 GiB, fps ≈0.30。Run A の α 平均は 0.0119 まで上昇しているため、白背景での差分は α 目標更新由来と判断。
+  - 次手: Run A をベースに 1) 60K への延長可否検討、2) α target を 0.22 前後で微調整、3) サンプル数 or feature 蒸留の追加で +0.5 dB を狙う。Run B 系は α 緩和(warmup 延長/target 0.16〜0.18)の再試行が必要。
+
+  **Run A 40K 評価（2025-10-27 午後）**
+  - 40K checkpoint（single_view_overfit_v6_step040000_view000）を 1 枚評価した結果、白背景/前景とも PSNR 18.324 dB・SSIM 0.757・LPIPS 0.425。50K checkpoint との差分は ΔPSNR_white = −0.002 dB, ΔPSNR_fg = −0.002 dB で実質的な伸び無し。
+  - 白−前景ギャップは 0.000 dB のまま（背景誤差支配は解消済み）。α ヒストグラム P99 も 50K 時点と同程度で飽和は見られず。
+  - 判定: 40K→50K で +0.5 dB を満たさないため 60K 延長は保留。今後伸ばすには α 設計か LR テールの再調整が必須。
+  - 次手候補: (1) min lr を 3e-5 へ下げた派生（Run A’）で 50K を再実行し、color loss テールを再確認。(2) α target 0.22 試行と warmup 延長を組み合わせた Run A'' を計画。(3) feature 蒸留の軽量追加（L2 微量）で白背景の微差を詰める案を検討。
+
+  **Run A′ 設定（2025-10-27 夜着手）**
+  - Config: `configs/generated/lego_single_view_overfit_v6_tail.yaml`
+    - `samples_per_ray=160`（終盤の高周波拾い目的で一段増し。VRAM ≈1.3 GiB を想定）
+    - `lr_schedule_steps=45000` で 45K 時点に最小学習率へ到達させ、`lr_schedule_min_lr=3e-5` に下げてテールを強化
+    - `ema_decay=0.9998` で後半 EMA を重めに維持
+    - α ターゲット周りは Run A と同一（target 0.21 / max_weight 0.22）
+  - 実行手順: 旧ログ/出力（`logs/lego/single_view_overfit_v6_tail`, `results/lego/single_view_overfit_v6_tail`）を削除→TensorBoard (port 6006) 起動→50K ラン。
+  - 評価ポイント: **45K / 50K** の 2 点で単フレームをレンダし、`ΔPSNR_white`・`ΔPSNR_fg`・`PSNR_white − PSNR_fg`・`alpha.mean_frame` P95/P99 を記録。
+  - Go 判定: 50K で +0.4〜0.5 dB 近辺の伸び（白/前景とも）を確認できれば同設定で 60K 延長を再検討。
+  - No-Go 判定: +0.2 dB 未満かつ α P99 が上昇したら Run A′ は打ち切り、Run A″ へ移行。
+
+  **Run A′ 結果（2025-10-28 朝）**
+  - 40K: PSNR 19.164 dB / SSIM 0.757 / LPIPS 0.426（前景 PSNR 同値、白−前景ギャップ 0.000 dB）。
+  - 50K: PSNR 19.175 dB / SSIM 0.758 / LPIPS 0.424（前景 PSNR 同値、ギャップ 0.000 dB）。ΔPSNR_white ≈ +0.011 dB で 60K 延長条件 (+0.4 dB) 未達。
+  - `training_metrics.csv` では color ≈0.127（Run A 比 ≈−0.026）、`opacity.target_weight_effective` は 0.12 に収束、α guard penalty 0.0 を維持。
+  - ベースライン比 +0.85 dB までジャンプした一方、40K→50K の伸びは頭打ち。次ステップとして Run A″（α 立ち上げ遅延）の準備に移行。
+
+  **Run A″ 設定（2025-10-28 着手）**
+  - Config: `configs/generated/lego_single_view_overfit_v6_warm.yaml`
+    - Run A′ の lr/samples 設定（`samples_per_ray=160`, `lr_schedule_steps=45000`, `lr_schedule_min_lr=3e-5`, `ema_decay=0.9998`）を継承。
+    - `loss.opacity` の立ち上げを遅らせるため `start_weight=0.025`, `warmup_steps=6000`, `schedule_duration=18000` へ変更（target=0.21, target_weight=0.12, max_weight=0.22 は据え置き）。
+  - 目的: α 平均の過密化を抑えつつ 45K 以降の color loss 微減を狙う。Run A′ で止まった ΔPSNR を再び +0.4 dB 以上へ導けるかを確認する。
+  - 実行プラン: 50K まで走行し、40K/45K/50K をレンダ → `ΔPSNR_white` / `ΔPSNR_fg` / `PSNR_white − PSNR_fg` を記録。Go 条件は 45K→50K で +0.4 dB 以上の伸び（白/前景とも）。
+  - 判定: 条件未達なら α target を 0.22 へ上げる or α warmup をさらに延長した Run A‴ を検討。ΔPSNR が改善した場合のみ 60K 延長案を再評価。
+
+  **Run A′/A″ 進捗サマリ（2025-10-28）**
+  - Run A′ (`single_view_overfit_v6_tail`): 40K/50K とも白・前景 PSNR=19.17 dB 前後、ΔPSNR_white=+0.011 dB。color loss ≈0.127 まで低下しベースライン比で +0.85 dB だが、終盤の伸びは停滞。
+  - 背景ギャップ解消済み（白−前景=0.000 dB）で α ガードも安定。課題は 45K 以降の微増を再び引き出すこと。
+  - Run A″ は α の立ち上げを遅らせてテールの余力を残し、45K→50K で +0.4 dB 以上伸ばせるかを検証する。Go なら 60K 延長、No-Go なら α target 引き上げやさらに長い warmup を用意した Run A‴ を計画。
+
+  **直近アドバイス反映 — Run A/B 運用メモ（2025-10-27 追加）**
+  - Run A は Go 候補。まず 40K checkpoint を 1 枚評価し、50K と比較して白/前景 PSNR の差分を記録。+0.5 dB 以上の伸びが確認できたら 60K 延長へ。
+  - Run B は α 緩和方向の切り分け要員として保持。Run A の伸びが α 上げに起因することが確定したため、B 側は target を下げつつ立ち上がりを遅くする案で継続検討。
+  - 60K 延長時の最小変更: (1) LR テールをさらに下げて終盤の微調整余地を確保。(2) 40K 以降で EMA を強めて評価ノイズを抑制。(3) 終盤のみ samples_per_ray を段階的に増量（VRAM と相談）。(4) α 目標は Run A を基準に極小幅で上積みし、縁が硬くなったら warmup を微延長。(5) 余裕があれば最終数チェックポイントで SWA 併用。
+  - 用語表記を統一: `alpha.mean_frame`（レンダ画素 α 平均）、`opacity.target_weight_effective`（α ロス有効重み）、`alpha_guard.penalty`（ガードペナルティ）。ノート内はこの表記で統一する。
+  - 監視メトリクスを 2 つ追加: (1) ΔPSNR_white / ΔPSNR_fg（40K→50K）。(2) 白−前景ギャップ（PSNR_white − PSNR_fg）。ギャップが正なら背景誤差支配→α 設計を優先。負なら前景支配→LR テール強化やサンプル増しが有効。
+  - 60K 延長オペ: 40K 評価→50→60K 延長→58〜60K を EMA（可能なら SWA）評価。50K→58K で +0.2 dB 未満かつ α ヒストグラム P99 が上昇した場合は延長を打ち切る。
+  - 即応ルール: 45K で停滞を感じたら min lr を早めに下げ、縁が硬い/ハロが出たら α 立ち上がりを遅らせる。VRAM が厳しい場合は終盤サンプル増しを二段階で小さく。
+  - Run B の役割: 背景誤差切り分け専用として α 緩和（target 低め＋長め warmup）を試す。Run A で伸びない場合のバックアッププランとして維持。
+2. 終盤サンプル増し: 高周波不足と判断したら後半のみ samples_per_ray を増量。
+3. EMA/SWA 強化: decay を一段上げる、最終 2〜4K を SWA で平滑化。
+4. 容量微増: hidden_dim を 80〜96 に拡張（層数据え置き）し同設定を再実行。
+
+**Go / No-Go 判定**
+- Go (60K 延長): 40K→50K で +0.5 dB 以上の伸びかつ前景≧白。
+- No-Go: color 横ばい + α の薄さ/固さが改善せず → Run B へ切り替え、もしくは α/warmup を逆方向へ振って再試行。
+
+**評価まわりの注意**
+- 評価は必ず EMA 重みで実施し、非 EMA と差が出る場合はノイズ対策（EMA/SWA）を優先。
+- レンダは `view000` 単フレームで統一し、平均化による指標低下を避ける。
+- 白 PSNR と前景 PSNR の差で背景誤差支配かどうかを即判定。背景が勝つなら α 設計を先に触る。
+
+**症状別クイック処方**
+- 背景がうるさく白 PSNR が低い → α target +0.01、warmup 短め。
+- 縁が硬くハロが気になる → warmup 長め + target 据え置き or ほんの少し下げ。
+- color が微動だにしない → min lr のテールをさらに下げ (≈3e-5) + 終盤サンプル増し。
+- 指標が散る → EMA 強化 + SWA で最終帯を平滑化。
+
+---
+
 ## 2025-10-22 — Evaluation 一貫性チェックツール整備
 
 * `tools/eval_consistency.py` を新規作成。教師アセット（RGBA/深度/チェックポイント）の存在確認→学生レンダの整合性チェック→必要に応じて再合成＋メトリクス再計算まで一括で実行できるようにした。
