@@ -716,6 +716,9 @@ class LossConfig:
     opacity_weight: float
     color_type: str = "l2"
     color_eps: float = 1e-3
+    color_secondary_type: Optional[str] = None
+    color_secondary_weight: float = 0.0
+    color_secondary_eps: float = 1e-3
     opacity_type: str = "l1"
     temperature: float = 1.0
     opacity_temperature: Optional[float] = None
@@ -742,6 +745,8 @@ class LossConfig:
     background_color: Optional[Tuple[float, float, float]] = None
     opacity_target_hysteresis: bool = True
     opacity_target_max_weight: Optional[float] = None
+    opacity_mean_target: Optional[float] = None
+    opacity_mean_weight: float = 0.0
 
 
 @dataclass
@@ -2957,11 +2962,32 @@ def parse_config(path: Path):
     if opacity_max_weight is not None and opacity_max_weight < 0.0:
         opacity_max_weight = 0.0
 
+    color_secondary_type_raw = color_raw.get("secondary_type")
+    color_secondary_type = str(color_secondary_type_raw).strip().lower() if color_secondary_type_raw is not None else None
+    if color_secondary_type == "":
+        color_secondary_type = None
+    color_secondary_weight_value = _coerce_float(color_raw.get("secondary_weight"), 0.0)
+    if color_secondary_weight_value is None:
+        color_secondary_weight_value = 0.0
+    color_secondary_weight_value = float(min(max(color_secondary_weight_value, 0.0), 1.0))
+    color_secondary_eps_value = _coerce_float(color_raw.get("secondary_eps"), color_eps_value)
+    if color_secondary_eps_value is None or color_secondary_eps_value <= 0.0:
+        color_secondary_eps_value = color_eps_value
+
+    opacity_mean_target = _coerce_float(opacity_raw.get("mean_target"))
+    opacity_mean_weight = _coerce_float(opacity_raw.get("mean_weight"), 0.0)
+    if opacity_mean_weight is None:
+        opacity_mean_weight = 0.0
+    opacity_mean_weight = max(0.0, float(opacity_mean_weight))
+
     loss_cfg = LossConfig(
         color_weight=float(color_raw["weight"]),
         opacity_weight=float(opacity_raw["weight"]),
         color_type=color_raw.get("type", "l2"),
         color_eps=float(color_eps_value),
+        color_secondary_type=color_secondary_type,
+        color_secondary_weight=float(color_secondary_weight_value),
+        color_secondary_eps=float(color_secondary_eps_value),
         opacity_type=opacity_raw.get("type", "l1"),
         temperature=float(loss_raw.get("distillation_temperature", 1.0)),
         opacity_temperature=(
@@ -2999,6 +3025,8 @@ def parse_config(path: Path):
         background_color=background_color_tuple,
         opacity_target_hysteresis=opacity_target_hysteresis,
         opacity_target_max_weight=opacity_max_weight,
+        opacity_mean_target=opacity_mean_target,
+        opacity_mean_weight=float(opacity_mean_weight),
     )
     feature_raw = raw.get("feature_pipeline", {})
     threshold_raw = feature_raw.get("boundary_mask_threshold", 0.75)
@@ -3277,16 +3305,25 @@ def compute_losses(
 ):
     losses: Dict[str, torch.Tensor] = {}
 
-    if cfg.color_type == "l2":
-        color_loss = torch.nn.functional.mse_loss(student_rgb, teacher_rgb)
-    elif cfg.color_type == "l1":
-        color_loss = torch.nn.functional.l1_loss(student_rgb, teacher_rgb)
-    elif cfg.color_type == "charbonnier":
-        eps = float(getattr(cfg, "color_eps", 1e-3) or 1e-3)
-        diff = student_rgb - teacher_rgb
-        color_loss = torch.sqrt(diff * diff + eps * eps).mean()
-    else:
-        raise ValueError(f"Unsupported color loss type: {cfg.color_type}")
+    def _compute_color_core(loss_type: str, eps_value: float) -> torch.Tensor:
+        if loss_type == "l2":
+            return torch.nn.functional.mse_loss(student_rgb, teacher_rgb)
+        if loss_type == "l1":
+            return torch.nn.functional.l1_loss(student_rgb, teacher_rgb)
+        if loss_type == "charbonnier":
+            eps_local = float(eps_value or 1e-3)
+            diff_local = student_rgb - teacher_rgb
+            return torch.sqrt(diff_local * diff_local + eps_local * eps_local).mean()
+        raise ValueError(f"Unsupported color loss type: {loss_type}")
+
+    color_primary = _compute_color_core(cfg.color_type, float(getattr(cfg, "color_eps", 1e-3) or 1e-3))
+    color_loss = color_primary
+    if cfg.color_secondary_type and float(cfg.color_secondary_weight) > 0.0:
+        secondary_core = _compute_color_core(cfg.color_secondary_type, float(cfg.color_secondary_eps or cfg.color_eps))
+        blend = float(cfg.color_secondary_weight)
+        blend = min(max(blend, 0.0), 1.0)
+        color_loss = (1.0 - blend) * color_loss + blend * secondary_core
+        losses["color_secondary_component"] = cfg.color_weight * secondary_core
     losses["color"] = cfg.color_weight * color_loss
 
     student_opacity = student_sigma
@@ -3304,6 +3341,11 @@ def compute_losses(
     else:
         raise ValueError(f"Unsupported opacity loss type: {cfg.opacity_type}")
     losses["opacity"] = cfg.opacity_weight * opacity_loss
+
+    if cfg.opacity_mean_target is not None and cfg.opacity_mean_weight > 0.0:
+        mean_target_value = float(cfg.opacity_mean_target)
+        mean_residual = (student_opacity.mean() - mean_target_value).abs()
+        losses["opacity_mean"] = cfg.opacity_mean_weight * mean_residual
 
     if (
         cfg.depth_weight > 0.0
@@ -3339,7 +3381,9 @@ def compute_losses(
         losses["depth"] = cfg.depth_weight * depth_loss
 
     total_loss = torch.zeros((), device=student_rgb.device)
-    for value in losses.values():
+    for key, value in losses.items():
+        if key == "color_secondary_component":
+            continue
         total_loss = total_loss + value
 
     effective_opacity_target_weight = float(
@@ -5250,6 +5294,31 @@ def train(
             alpha_fraction_ge95 = (student_sigma >= 0.95).float().mean()
             alpha_fraction_le05 = (student_sigma <= 0.05).float().mean()
             alpha_fraction_mid = torch.clamp(1.0 - alpha_fraction_ge95 - alpha_fraction_le05, 0.0, 1.0)
+            alpha_quantile_p50: torch.Tensor
+            alpha_quantile_p90: torch.Tensor
+            alpha_quantile_p99: torch.Tensor
+            if student_sigma.numel() > 0:
+                try:
+                    alpha_flat = student_sigma.reshape(-1)
+                    quantile_points = torch.tensor(
+                        [0.50, 0.90, 0.99],
+                        dtype=alpha_flat.dtype,
+                        device=alpha_flat.device,
+                    )
+                    alpha_quantiles = torch.quantile(alpha_flat, quantile_points)
+                    alpha_quantile_p50 = alpha_quantiles[0]
+                    alpha_quantile_p90 = alpha_quantiles[1]
+                    alpha_quantile_p99 = alpha_quantiles[2]
+                except RuntimeError:
+                    nan_tensor = torch.tensor(float("nan"), device=device, dtype=student_sigma.dtype)
+                    alpha_quantile_p50 = nan_tensor
+                    alpha_quantile_p90 = nan_tensor
+                    alpha_quantile_p99 = nan_tensor
+            else:
+                nan_tensor = torch.tensor(float("nan"), device=device, dtype=student_sigma.dtype)
+                alpha_quantile_p50 = nan_tensor
+                alpha_quantile_p90 = nan_tensor
+                alpha_quantile_p99 = nan_tensor
             alpha_band_core = (
                 torch.nn.functional.relu(alpha_mean_tensor - 0.45)
                 + torch.nn.functional.relu(0.35 - alpha_mean_tensor)
@@ -5987,6 +6056,9 @@ def train(
             log_metrics["alpha_fraction_le05"] = alpha_fraction_le05.detach()
             log_metrics["alpha_fraction_mid"] = alpha_fraction_mid.detach()
             log_metrics["alpha_penalty_core"] = alpha_penalty_core.detach()
+            log_metrics["alpha_quantile_p50"] = alpha_quantile_p50.detach()
+            log_metrics["alpha_quantile_p90"] = alpha_quantile_p90.detach()
+            log_metrics["alpha_quantile_p99"] = alpha_quantile_p99.detach()
             log_metrics["alpha_penalty_weight"] = torch.tensor(alpha_penalty_weight, device=device)
             log_metrics["alpha_guard_avg_penalty"] = torch.tensor(alpha_guard_avg_penalty, device=device)
             log_metrics["alpha_penalty_weight_target"] = torch.tensor(
@@ -6287,6 +6359,9 @@ def train(
             base_log_metrics["opacity_target_weight_base"] = torch.tensor(opacity_target_weight_base, device=device)
             base_log_metrics["opacity_target_adjustment"] = torch.tensor(opacity_target_adjustment, device=device)
             base_log_metrics["opacity_lambda_runtime"] = torch.tensor(opacity_lambda_runtime, device=device)
+            base_log_metrics.setdefault("alpha_quantile_p50", alpha_quantile_p50.detach())
+            base_log_metrics.setdefault("alpha_quantile_p90", alpha_quantile_p90.detach())
+            base_log_metrics.setdefault("alpha_quantile_p99", alpha_quantile_p99.detach())
     
             metrics_floats_for_log = write_metrics_csv(global_step, total_val, base_log_metrics)
             metrics_floats_for_tb = dict(metrics_floats_for_log)

@@ -202,9 +202,17 @@ def _validate_loss(section: Mapping[str, Any]) -> None:
         if key not in section:
             raise ValueError(f"'loss.{key}' is required")
     color = _ensure_mapping(section["color"], "loss.color")
-    _check_unknown_keys(color, {"type", "weight", "eps", "epsilon"}, "loss.color")
+    _check_unknown_keys(
+        color,
+        {"type", "weight", "eps", "epsilon", "secondary_type", "secondary_weight", "secondary_eps"},
+        "loss.color",
+    )
     if "weight" in color:
         _ensure_float(color["weight"], "loss.color.weight")
+    if "secondary_weight" in color:
+        _ensure_float(color["secondary_weight"], "loss.color.secondary_weight")
+    if "secondary_eps" in color:
+        _ensure_float(color["secondary_eps"], "loss.color.secondary_eps")
     opacity_allowed = {
         "type",
         "weight",
@@ -215,6 +223,8 @@ def _validate_loss(section: Mapping[str, Any]) -> None:
         "schedule",
         "schedule_duration",
         "background_threshold",
+        "mean_target",
+        "mean_weight",
         "temperature",
         "lambda",
         "warmup_step",
@@ -228,6 +238,10 @@ def _validate_loss(section: Mapping[str, Any]) -> None:
     _check_unknown_keys(opacity, opacity_allowed, "loss.opacity")
     if "weight" in opacity:
         _ensure_float(opacity["weight"], "loss.opacity.weight")
+    if "mean_target" in opacity:
+        _ensure_float(opacity["mean_target"], "loss.opacity.mean_target")
+    if "mean_weight" in opacity:
+        _ensure_float(opacity["mean_weight"], "loss.opacity.mean_weight")
     if "warmup_steps" in opacity:
         _ensure_int(opacity["warmup_steps"], "loss.opacity.warmup_steps", min_value=0)
     if "depth" in section and section["depth"] is not None:
