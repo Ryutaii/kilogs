@@ -95,11 +95,28 @@ Stable, reproducible pipeline for rendering & evaluating student vs teacher on *
 - v6_tail (PSNR 19.175 dB) 比較では、v7 で追加した `mean_target=0.32` / `mean_weight=0.02` と Charbonnier+L2 の長時間テールが α を過密化し、PSNR を 0.8 dB 以上落としたと推定。
 - `alpha_guard` を無効化したままだとペナルティ指標だけが高止まりするため、次ランでは軽量 guard を再び有効化して α 分布を抑制する必要がある。
 
-**次ラン (v8 案) の変更点**
-- `configs/generated/lego_single_view_overfit_v8.yaml` を作成予定。`loss.color.secondary_weight=0.10` に下げて L2 の影響を補助レベルへ調整。
-- `loss.opacity`: `target_weight=0.10`, `start_weight=0.035`, `max_weight=0.20`, `warmup_steps=2600`, `mean_target=0.24`, `mean_weight=0.008` とし、α 立ち上げを遅らせつつ平均値の押し上げを弱める。
-- `alpha_guard` を有効化 (`initial_weight=0.05`, `weight_floor=0.02`, `weight_cap=0.08`, `penalty_hi=0.20`, `penalty_lo=0.03`, `adjustment_smoothing=0.18`, `check_interval=200`) して過剰密度を自動的に抑制。
-- 学習率テールは v6_tail の実績を踏襲 (`lr_schedule_steps=45000`, `lr_schedule_min_lr=3.0e-5`, `max_steps=52000`)。監視目標: `alpha.p50_ray≤0.16`, `alpha_guard_penalty≤0.04`, `alpha.halo_indicator≤0.02`。
+**次ラン (v8) 実装メモ**
+- `configs/generated/lego_single_view_overfit_v8.yaml` を確定。Charbonnier 主体で `loss.color.secondary_weight=0.06` に縮小し、L2 は終盤ブレ補助に留める。
+- `loss.opacity`: `target_weight=0.10`, `start_weight=0.035`, `max_weight=0.20`, `warmup_steps=2600`, `mean_target=0.24`, `mean_weight=0.008`。α の過密化を遅らせつつ平均値を 0.22〜0.24 帯へ誘導。
+- `alpha_guard` 再有効化 (`initial_weight=0.05`, `weight_floor=0.02`, `weight_cap=0.08`, `penalty_hi=0.20`, `penalty_lo=0.03`, `adjustment_smoothing=0.18`, `check_interval=256`)。緩めの smoothing でジッタを抑える。
+- 学習率は 45K ステップで `min_lr=3.0e-5` へ到達し、その後 52K までフラット。伸びが止まった場合のみ再実行で `min_lr=2.0e-5` に引き下げる。
+- 終盤 2K ステップ (>=50K) で `samples_per_ray` を 160→192 (×1.2) に引き上げるため `samples_per_ray_tail_start=50000`, `samples_per_ray_tail_scale=1.2` を追加。
+
+**v8 ランの監視指標と意思決定**
+- α 監視は `alpha.p99_ray`, `alpha.spread`, `alpha.tail_slope` の 3 本に集約。`p99≥0.985` 連続 + `spread↑` or `tail_slope>0` でハロ警戒。`p50≤0.15` 長期 + 白PSNR≧前景でリーク警戒。
+- Go 条件: 45K→50K で 白/前景ともに +0.4 dB 以上、`spread` 非拡大、`alpha_guard_penalty≤0.04`。満たせば 52K まで走らせて 60K 延長可否を判断。
+- No-Go 条件: ΔPSNR < +0.3 dB もしくは `p99` と `spread` が同時に増加。まず `warmup_steps` 延長や L2 削減で調整し、α ターゲット変更は最後の手段。
+- α ガード自動ルール: `p99` 3 連続増加 + color 横ばい → ターゲット据え置きで warmup を +500〜800。`p50` 低止まり + 白>前景 → mean_target 据え置きのまま target を +0.01、ガードは触らない。
+- ログ取り注意: `torch.quantile` は FP32 + detach 済み。NaN/Inf は直前値保持で線を切らない (既存実装で確保済み)。
+- 最終 2K で `ema_decay` を 0.9998→0.9999 へ段階アップ + SWA 1–2K 窓を試す (評価は EMA/SWA のみ使用)。
+
+**2025-10-29 — v8 実行ログ / 所見**
+- 実行設定: tail oversampling (>=50K→192 samples), `alpha_guard` 再有効化、L2 0.06。deterministic env (`PYTHONHASHSEED=2025`, `CUBLAS_WORKSPACE_CONFIG=:4096:8`) で 52K まで完走。
+- 訓練ログ: 8K ステップ時点で `alpha.halo_indicator≈0.287`, `alpha_guard_penalty≈0.023`。tail window 直前までは guard がペナルティ 0.02台で安定、`tail_slope=0` に留まる。
+- 52K チェックポイントの白背景指標: PSNR **18.684 dB**, SSIM **0.794**, LPIPS **0.373**, 前景 PSNR も同値 (ログ: `results/lego/single_view_overfit_v8/eval_single_view_step052000_view000/metrics_white.json`)。`metrics_summary.csv` を `single_view_overfit_v8_step052000_view000` で更新済み。
+- v7 step_052000 と比較すると +0.32 dB / +0.038 SSIM / -0.051 LPIPS と改善。v6_tail (19.18 dB) には未到達だが、ハロ指標を抑えつつ回復途上。
+- tail oversampling に伴う GPU peak ≈3.24 GiB, FPS ≈0.23。リソース増加は許容範囲。
+- TODO: 1) 50K チェックポイントも評価し tail window 効果を分離、2) α 指標 (p99/spread/tail_slope) の 45K→52K 推移を確認、3) 追加で mean_target や guard パラメータを微調整して v6_tail と同等 PSNR を狙う。
 
 **最新アドバイス反映 — 単視点 v5 改善ロードマップ（2025-10-27 夜時点）**
 

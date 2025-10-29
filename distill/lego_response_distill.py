@@ -648,6 +648,8 @@ class TrainConfig:
     lr_schedule_min_lr: Optional[float]
     lr_schedule_steps: Optional[int]
     lr_warmup_steps: int
+    samples_per_ray_tail_start: Optional[int] = None
+    samples_per_ray_tail_scale: float = 1.0
     phases: Tuple[TrainPhaseConfig, ...] = tuple()
     promotion_gates: Tuple[int, ...] = tuple()
     promotion_min_mask_fraction: float = 0.0
@@ -2843,6 +2845,25 @@ def parse_config(path: Path):
         cooldown_steps=int(mask_prefail_section.get("cooldown_steps", 200) or 200),
     )
 
+    samples_tail_start_raw = train_section.get("samples_per_ray_tail_start")
+    if samples_tail_start_raw is None:
+        samples_per_ray_tail_start: Optional[int] = None
+    else:
+        try:
+            samples_per_ray_tail_start = int(samples_tail_start_raw)
+        except (TypeError, ValueError):
+            samples_per_ray_tail_start = None
+        if samples_per_ray_tail_start is not None and samples_per_ray_tail_start < 0:
+            samples_per_ray_tail_start = 0
+
+    samples_tail_scale_raw = train_section.get("samples_per_ray_tail_scale", 1.0)
+    try:
+        samples_per_ray_tail_scale = float(samples_tail_scale_raw)
+    except (TypeError, ValueError):
+        samples_per_ray_tail_scale = 1.0
+    if not math.isfinite(samples_per_ray_tail_scale) or samples_per_ray_tail_scale < 1.0:
+        samples_per_ray_tail_scale = 1.0
+
     train_cfg = TrainConfig(
         max_steps=max_steps_value,
         eval_interval=int(train_section.get("eval_interval", 0)),
@@ -2858,6 +2879,8 @@ def parse_config(path: Path):
         lr_schedule_min_lr=lr_min,
         lr_schedule_steps=lr_schedule_steps,
         lr_warmup_steps=lr_warmup_steps,
+        samples_per_ray_tail_start=samples_per_ray_tail_start,
+        samples_per_ray_tail_scale=samples_per_ray_tail_scale,
         phases=tuple(phase_configs),
         promotion_gates=promotion_gates,
         promotion_min_mask_fraction=promotion_min_mask_fraction,
@@ -2866,8 +2889,8 @@ def parse_config(path: Path):
         promotion_min_feature_ratio=promotion_min_feature_ratio,
         promotion_min_opacity_ratio=promotion_min_opacity_ratio,
         promotion_projector_in_dim=promotion_projector_in_dim,
-    promotion_require_feature_schedule_terminal=require_feature_terminal,
-    promotion_require_opacity_schedule_terminal=require_opacity_terminal,
+        promotion_require_feature_schedule_terminal=require_feature_terminal,
+        promotion_require_opacity_schedule_terminal=require_opacity_terminal,
         promotion_exit_code=promotion_exit_code,
         effective_weight_avg_window=effective_weight_avg_window,
         alpha_guard=alpha_guard_cfg,
@@ -5293,6 +5316,23 @@ def train(
             current_lr = compute_learning_rate(global_step)
             for group in optimizer.param_groups:
                 group["lr"] = current_lr
+
+            samples_per_ray_base = int(data_cfg.samples_per_ray)
+            # Optional tail oversampling: bump samples_per_ray in the final window to capture high-frequency residuals.
+            samples_per_ray_step = samples_per_ray_base
+            samples_per_ray_scale = 1.0
+            tail_start_cfg = train_cfg.samples_per_ray_tail_start
+            if tail_start_cfg is not None and global_step >= tail_start_cfg:
+                tail_scale = max(float(train_cfg.samples_per_ray_tail_scale), 1.0)
+                scaled_value = int(round(samples_per_ray_base * tail_scale))
+                if scaled_value < samples_per_ray_base:
+                    scaled_value = samples_per_ray_base
+                samples_per_ray_step = max(scaled_value, samples_per_ray_base)
+                if samples_per_ray_base > 0:
+                    samples_per_ray_scale = samples_per_ray_step / float(samples_per_ray_base)
+                else:
+                    samples_per_ray_scale = 1.0
+
             if overfit_static_batch is not None:
                 batch = {
                     key: value.clone() if isinstance(value, torch.Tensor) else value
@@ -5319,7 +5359,7 @@ def train(
                 rays_d=rays_d,
                 near=near_selected,
                 far=far_selected,
-                num_samples=data_cfg.samples_per_ray,
+                num_samples=samples_per_ray_step,
                 perturb=ray_perturb_enabled,
             )
             pts_norm = (pts - bbox_min) / bbox_extent
@@ -5328,7 +5368,7 @@ def train(
             ray_dirs = F.normalize(rays_d, dim=-1, eps=1e-6)
             ray_dirs_flat = (
                 ray_dirs[:, None, :]
-                .expand(-1, data_cfg.samples_per_ray, -1)
+                .expand(-1, samples_per_ray_step, -1)
                 .reshape(-1, 3)
             )
 
@@ -5343,8 +5383,8 @@ def train(
                     suppress_manual_progress = False
                     progress_initially_hidden = False
                 first_forward_logged = True
-            student_rgb_samples = student_rgb_samples.view(-1, data_cfg.samples_per_ray, 3)
-            student_sigma_samples = student_sigma_samples.view(-1, data_cfg.samples_per_ray)
+            student_rgb_samples = student_rgb_samples.view(-1, samples_per_ray_step, 3)
+            student_sigma_samples = student_sigma_samples.view(-1, samples_per_ray_step)
 
             deltas = z_vals[:, 1:] - z_vals[:, :-1]
             delta_last = torch.full((deltas.shape[0], 1), 1e10, device=device)
@@ -5648,7 +5688,7 @@ def train(
                     try:
                         student_pre = student_pre.view(
                             student_rgb_samples.shape[0],
-                            data_cfg.samples_per_ray,
+                            samples_per_ray_step,
                             student_pre.shape[-1],
                         )
                         expected_student_dim = getattr(feature_projector.cfg, "input_dim", None)
@@ -5698,7 +5738,7 @@ def train(
                                 cell_indices = cell_indices.to(device)
                                 cells_per_ray = cell_indices.view(
                                     student_rgb_samples.shape[0],
-                                    data_cfg.samples_per_ray,
+                                    samples_per_ray_step,
                                 )
     
                                 primary_sample = torch.argmax(weights, dim=-1)
@@ -5765,7 +5805,7 @@ def train(
                                 gathered = gaussian_features_device.index_select(0, cell_indices)
                                 gathered = gathered.view(
                                     student_rgb_samples.shape[0],
-                                    data_cfg.samples_per_ray,
+                                    samples_per_ray_step,
                                     gathered.shape[-1],
                                 )
     
@@ -5934,11 +5974,11 @@ def train(
                                         if (
                                             aux_raw.dim() == 2
                                             and aux_raw.shape[0]
-                                            == student_rgb_samples.shape[0] * data_cfg.samples_per_ray
+                                            == student_rgb_samples.shape[0] * samples_per_ray_step
                                         ):
                                             aux_tensor = aux_raw.view(
                                                 student_rgb_samples.shape[0],
-                                                data_cfg.samples_per_ray,
+                                                samples_per_ray_step,
                                                 aux_raw.shape[-1],
                                             )
                                             aux_tensor = torch.sum(weights[..., None] * aux_tensor, dim=-2)
@@ -6248,6 +6288,8 @@ def train(
             log_metrics["opacity_target_adjustment"] = torch.tensor(opacity_target_adjustment, device=device)
             log_metrics["opacity_lambda_runtime"] = torch.tensor(opacity_lambda_runtime, device=device)
             log_metrics["learning_rate"] = torch.tensor(current_lr, device=device)
+            log_metrics["samples_per_ray"] = torch.tensor(float(samples_per_ray_step), device=device)
+            log_metrics["samples_per_ray_scale"] = torch.tensor(float(samples_per_ray_scale), device=device)
             log_metrics["alpha_mean"] = alpha_mean_tensor.detach()
             log_metrics["alpha_fraction_ge95"] = alpha_fraction_ge95.detach()
             log_metrics["alpha_fraction_le05"] = alpha_fraction_le05.detach()
@@ -6567,6 +6609,8 @@ def train(
                     base_log_metrics[optional_key] = log_metrics[optional_key]
             base_log_metrics["metrics_schema_version"] = torch.tensor(float(METRICS_SCHEMA_VERSION), device=device)
             base_log_metrics["learning_rate"] = torch.tensor(current_lr, device=device)
+            base_log_metrics["samples_per_ray"] = torch.tensor(float(samples_per_ray_step), device=device)
+            base_log_metrics["samples_per_ray_scale"] = torch.tensor(float(samples_per_ray_scale), device=device)
             base_log_metrics["phase_index"] = torch.tensor(float(current_phase_index), device=device)
             base_log_metrics["phase_feature_scale"] = torch.tensor(float(phase_feature_loss_scale), device=device)
             base_log_metrics["opacity_target_weight_effective"] = torch.tensor(opacity_target_weight_effective, device=device)
