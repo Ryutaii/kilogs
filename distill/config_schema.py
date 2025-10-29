@@ -293,6 +293,12 @@ def _validate_loss(section: Mapping[str, Any]) -> None:
                 "max_lambda_delta",
                 "max_target_adjustment_delta",
                 "max_penalty_weight_delta",
+                "edge_focus_bandwidth",
+                "edge_focus_transition",
+                "edge_focus_margin",
+                "edge_focus_strength",
+                "edge_focus_max_weight",
+                "edge_focus_smoothing",
             },
             "loss.alpha_guard",
         )
@@ -315,6 +321,36 @@ def _validate_loss(section: Mapping[str, Any]) -> None:
             _ensure_float(
                 alpha_guard_map["max_penalty_weight_delta"],
                 "loss.alpha_guard.max_penalty_weight_delta",
+            )
+        if "edge_focus_bandwidth" in alpha_guard_map:
+            _ensure_float(
+                alpha_guard_map["edge_focus_bandwidth"],
+                "loss.alpha_guard.edge_focus_bandwidth",
+            )
+        if "edge_focus_transition" in alpha_guard_map:
+            _ensure_float(
+                alpha_guard_map["edge_focus_transition"],
+                "loss.alpha_guard.edge_focus_transition",
+            )
+        if "edge_focus_margin" in alpha_guard_map:
+            _ensure_float(
+                alpha_guard_map["edge_focus_margin"],
+                "loss.alpha_guard.edge_focus_margin",
+            )
+        if "edge_focus_strength" in alpha_guard_map:
+            _ensure_float(
+                alpha_guard_map["edge_focus_strength"],
+                "loss.alpha_guard.edge_focus_strength",
+            )
+        if "edge_focus_max_weight" in alpha_guard_map:
+            _ensure_float(
+                alpha_guard_map["edge_focus_max_weight"],
+                "loss.alpha_guard.edge_focus_max_weight",
+            )
+        if "edge_focus_smoothing" in alpha_guard_map:
+            _ensure_float(
+                alpha_guard_map["edge_focus_smoothing"],
+                "loss.alpha_guard.edge_focus_smoothing",
             )
 
 

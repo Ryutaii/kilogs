@@ -618,6 +618,12 @@ class AlphaGuardConfig:
     max_lambda_delta: float = 0.05
     max_target_adjustment_delta: float = 0.1
     max_penalty_weight_delta: float = 0.05
+    edge_focus_bandwidth: float = 0.0
+    edge_focus_transition: float = 0.0
+    edge_focus_margin: float = 0.0
+    edge_focus_strength: float = 0.0
+    edge_focus_max_weight: float = 0.0
+    edge_focus_smoothing: float = 0.0
 
 
 @dataclass
@@ -1430,6 +1436,31 @@ def _compute_patch_cosine_loss(
     return cosine_distance.mean()
 
 
+def _compute_edge_strength_map(alpha_frame: torch.Tensor) -> torch.Tensor:
+    """Approximate edge strength from a single alpha frame (values in [0, 1])."""
+
+    if alpha_frame.ndim == 3 and alpha_frame.shape[-1] == 1:
+        working = alpha_frame[..., 0]
+    else:
+        working = alpha_frame
+    if working.ndim != 2:
+        working = working.view(working.shape[0], working.shape[1])
+
+    working = working.to(dtype=torch.float32)
+    dx = torch.zeros_like(working)
+    dy = torch.zeros_like(working)
+    dx[:, :-1] = torch.abs(working[:, 1:] - working[:, :-1])
+    dy[:-1, :] = torch.abs(working[1:, :] - working[:-1, :])
+    gradient = torch.sqrt(dx * dx + dy * dy).clamp(min=0.0)
+    gradient = gradient.unsqueeze(0).unsqueeze(0)
+    gradient = torch.nn.functional.avg_pool2d(gradient, kernel_size=3, stride=1, padding=1)
+    gradient = gradient.squeeze(0).squeeze(0)
+    max_val = float(gradient.max().item()) if gradient.numel() > 0 else 0.0
+    if max_val > 0.0 and math.isfinite(max_val):
+        gradient = gradient / max_val
+    return gradient
+
+
 class LegoRayDataset(Dataset):
     """Dataset exposing per-frame teacher supervision and camera parameters."""
 
@@ -1550,6 +1581,12 @@ class LegoRayDataset(Dataset):
         self.focal = 0.5 * self.width / np.tan(0.5 * self.camera_angle_x)
         self.bbox_min = torch.tensor(config.bbox_min, dtype=torch.float32)
         self.bbox_max = torch.tensor(config.bbox_max, dtype=torch.float32)
+        self.edge_strength_flat: List[torch.Tensor] = []
+        self._edge_strength_device_cache: Dict[int, Dict[torch.device, torch.Tensor]] = {}
+
+        for frame_alpha in teacher_alpha:
+            edge_map = _compute_edge_strength_map(frame_alpha.squeeze(-1))
+            self.edge_strength_flat.append(edge_map.reshape(-1).contiguous())
 
         tqdm.write(
             "[dataset] Loaded teacher supervision frames: "
@@ -1566,6 +1603,14 @@ class LegoRayDataset(Dataset):
             "c2w": self.c2w_mats[idx],
             "index": idx,
         }
+
+    def _edge_strength_for_device(self, frame_idx: int, device: torch.device) -> torch.Tensor:
+        cache = self._edge_strength_device_cache.setdefault(frame_idx, {})
+        cached = cache.get(device)
+        if cached is None or cached.device != device:
+            cached = self.edge_strength_flat[frame_idx].to(device)
+            cache[device] = cached
+        return cached
 
     def _load_optional_depth(self, base: Path, frame_idx: int) -> Optional[torch.Tensor]:
         """Attempt to load a depth map corresponding to a teacher frame."""
@@ -1649,6 +1694,7 @@ class LegoRayDataset(Dataset):
         rgb_list: List[torch.Tensor] = []
         alpha_list: List[torch.Tensor] = []
         depth_list: List[torch.Tensor] = []
+        edge_strength_list: List[torch.Tensor] = []
 
         frame_rgb_flat = frame_rgb.view(-1, 3)
         frame_alpha_flat = frame_alpha.view(-1, 1)
@@ -1696,6 +1742,9 @@ class LegoRayDataset(Dataset):
             alpha_list.append(frame_alpha_flat[selected_pixels])
             if frame_depth_flat is not None:
                 depth_list.append(frame_depth_flat[selected_pixels])
+            if self.edge_strength_flat:
+                edge_flat = self._edge_strength_for_device(frame_idx, device)
+                edge_strength_list.append(edge_flat[selected_pixels])
 
             collected += take
             attempts += 1
@@ -1713,6 +1762,11 @@ class LegoRayDataset(Dataset):
             depth_out = torch.cat(depth_list, dim=0)
         else:
             depth_out = None
+
+        if edge_strength_list:
+            edge_strength_out = torch.cat(edge_strength_list, dim=0).unsqueeze(-1)
+        else:
+            edge_strength_out = torch.zeros((rays_o_out.shape[0], 1), device=device, dtype=rgb_out.dtype)
 
         depth_valid_out: Optional[torch.Tensor] = None
         if depth_out is not None:
@@ -1736,6 +1790,7 @@ class LegoRayDataset(Dataset):
             "teacher_alpha": alpha_out,
             "teacher_depth": depth_out,
             "teacher_depth_valid_mask": depth_valid_out,
+            "edge_strength": edge_strength_out,
         }
 
 
@@ -2805,6 +2860,78 @@ def parse_config(path: Path):
             alpha_guard_max_penalty_weight_delta = 0.05
     alpha_guard_max_penalty_weight_delta = max(0.0, float(alpha_guard_max_penalty_weight_delta))
 
+    edge_focus_bandwidth_raw = alpha_guard_section.get("edge_focus_bandwidth")
+    if edge_focus_bandwidth_raw is None:
+        edge_focus_bandwidth = 0.0
+    else:
+        try:
+            edge_focus_bandwidth = float(edge_focus_bandwidth_raw)
+        except (TypeError, ValueError):
+            edge_focus_bandwidth = 0.0
+    if not math.isfinite(edge_focus_bandwidth):
+        edge_focus_bandwidth = 0.0
+    edge_focus_bandwidth = min(max(edge_focus_bandwidth, 0.0), 1.0)
+
+    edge_focus_transition_raw = alpha_guard_section.get("edge_focus_transition")
+    if edge_focus_transition_raw is None:
+        edge_focus_transition = 0.0
+    else:
+        try:
+            edge_focus_transition = float(edge_focus_transition_raw)
+        except (TypeError, ValueError):
+            edge_focus_transition = 0.0
+    if not math.isfinite(edge_focus_transition):
+        edge_focus_transition = 0.0
+    edge_focus_transition = max(edge_focus_transition, 0.0)
+
+    edge_focus_margin_raw = alpha_guard_section.get("edge_focus_margin")
+    if edge_focus_margin_raw is None:
+        edge_focus_margin = 0.0
+    else:
+        try:
+            edge_focus_margin = float(edge_focus_margin_raw)
+        except (TypeError, ValueError):
+            edge_focus_margin = 0.0
+    if not math.isfinite(edge_focus_margin):
+        edge_focus_margin = 0.0
+    edge_focus_margin = max(edge_focus_margin, 0.0)
+
+    edge_focus_strength_raw = alpha_guard_section.get("edge_focus_strength")
+    if edge_focus_strength_raw is None:
+        edge_focus_strength = 0.0
+    else:
+        try:
+            edge_focus_strength = float(edge_focus_strength_raw)
+        except (TypeError, ValueError):
+            edge_focus_strength = 0.0
+    if not math.isfinite(edge_focus_strength):
+        edge_focus_strength = 0.0
+    edge_focus_strength = max(edge_focus_strength, 0.0)
+
+    edge_focus_max_weight_raw = alpha_guard_section.get("edge_focus_max_weight")
+    if edge_focus_max_weight_raw is None:
+        edge_focus_max_weight = 0.0
+    else:
+        try:
+            edge_focus_max_weight = float(edge_focus_max_weight_raw)
+        except (TypeError, ValueError):
+            edge_focus_max_weight = 0.0
+    if not math.isfinite(edge_focus_max_weight):
+        edge_focus_max_weight = 0.0
+    edge_focus_max_weight = max(edge_focus_max_weight, 0.0)
+
+    edge_focus_smoothing_raw = alpha_guard_section.get("edge_focus_smoothing")
+    if edge_focus_smoothing_raw is None:
+        edge_focus_smoothing = 0.0
+    else:
+        try:
+            edge_focus_smoothing = float(edge_focus_smoothing_raw)
+        except (TypeError, ValueError):
+            edge_focus_smoothing = 0.0
+    if not math.isfinite(edge_focus_smoothing):
+        edge_focus_smoothing = 0.0
+    edge_focus_smoothing = min(max(edge_focus_smoothing, 0.0), 1.0)
+
     alpha_guard_cfg = AlphaGuardConfig(
         enabled=bool(alpha_guard_section.get("enabled", True)),
         check_interval=int(alpha_guard_section.get("check_interval", 200) or 200),
@@ -2829,6 +2956,12 @@ def parse_config(path: Path):
         max_lambda_delta=alpha_guard_max_lambda_delta,
         max_target_adjustment_delta=alpha_guard_max_target_adjustment_delta,
         max_penalty_weight_delta=alpha_guard_max_penalty_weight_delta,
+        edge_focus_bandwidth=edge_focus_bandwidth,
+        edge_focus_transition=edge_focus_transition,
+        edge_focus_margin=edge_focus_margin,
+        edge_focus_strength=edge_focus_strength,
+        edge_focus_max_weight=edge_focus_max_weight,
+        edge_focus_smoothing=edge_focus_smoothing,
     )
 
     mask_prefail_section = feature_raw.get("mask_prefail")
@@ -4022,6 +4155,15 @@ def train(
     alpha_guard_tighten_streak = 0
     alpha_guard_relax_streak = 0
     alpha_guard_last_direction: Optional[str] = None
+    edge_focus_bandwidth_cfg = min(max(float(getattr(alpha_guard_cfg, "edge_focus_bandwidth", 0.0) or 0.0), 0.0), 1.0)
+    edge_focus_transition_cfg = max(float(getattr(alpha_guard_cfg, "edge_focus_transition", 0.0) or 0.0), 0.0)
+    edge_focus_margin_cfg = max(float(getattr(alpha_guard_cfg, "edge_focus_margin", 0.0) or 0.0), 0.0)
+    edge_focus_strength_cfg = max(float(getattr(alpha_guard_cfg, "edge_focus_strength", 0.0) or 0.0), 0.0)
+    edge_focus_max_weight_cfg = max(float(getattr(alpha_guard_cfg, "edge_focus_max_weight", 0.0) or 0.0), 0.0)
+    edge_focus_smoothing_cfg = min(max(float(getattr(alpha_guard_cfg, "edge_focus_smoothing", 0.0) or 0.0), 0.0), 1.0)
+    edge_focus_mean_running = 0.0
+    edge_focus_activation_running = 0.0
+    edge_focus_multiplier_running = 1.0
 
     try:
         alpha_quantile_interval_env = os.getenv("KILOGS_ALPHA_QUANTILE_INTERVAL", "0") or "0"
@@ -4132,6 +4274,9 @@ def train(
     if teacher_feature_adapter is not None:
         trainable_parameters += list(teacher_feature_adapter.parameters())
     optimizer = torch.optim.Adam(trainable_parameters, lr=train_cfg.lr)
+    grad_monitor_params: List[torch.nn.Parameter] = [
+        param for param in trainable_parameters if param.requires_grad
+    ]
 
     opacity_scheduler = OpacityTargetScheduler(loss_cfg)
     start_step = 0
@@ -4223,6 +4368,30 @@ def train(
                     alpha_guard_penalty_history_sum += value
                 if alpha_guard_penalty_history:
                     alpha_guard_avg_penalty = alpha_guard_penalty_history_sum / len(alpha_guard_penalty_history)
+            edge_focus_mean_candidate = alpha_guard_state.get("edge_focus_mean_running")
+            if edge_focus_mean_candidate is not None:
+                try:
+                    edge_focus_mean_running = float(edge_focus_mean_candidate)
+                except (TypeError, ValueError):
+                    edge_focus_mean_running = 0.0
+            if not math.isfinite(edge_focus_mean_running):
+                edge_focus_mean_running = 0.0
+            edge_focus_activation_candidate = alpha_guard_state.get("edge_focus_activation_running")
+            if edge_focus_activation_candidate is not None:
+                try:
+                    edge_focus_activation_running = float(edge_focus_activation_candidate)
+                except (TypeError, ValueError):
+                    edge_focus_activation_running = 0.0
+            if not math.isfinite(edge_focus_activation_running):
+                edge_focus_activation_running = 0.0
+            edge_focus_multiplier_candidate = alpha_guard_state.get("edge_focus_multiplier_running")
+            if edge_focus_multiplier_candidate is not None:
+                try:
+                    edge_focus_multiplier_running = float(edge_focus_multiplier_candidate)
+                except (TypeError, ValueError):
+                    edge_focus_multiplier_running = 1.0
+            if not math.isfinite(edge_focus_multiplier_running) or edge_focus_multiplier_running < 1.0:
+                edge_focus_multiplier_running = 1.0
         mask_prefail_state = checkpoint.get("mask_prefail_state")
         if isinstance(mask_prefail_state, dict):
             history_raw = mask_prefail_state.get("history", [])
@@ -4336,6 +4505,9 @@ def train(
             "last_direction": str(alpha_guard_last_direction or ""),
             "tighten_streak": int(alpha_guard_tighten_streak),
             "relax_streak": int(alpha_guard_relax_streak),
+            "edge_focus_mean_running": float(edge_focus_mean_running),
+            "edge_focus_activation_running": float(edge_focus_activation_running),
+            "edge_focus_multiplier_running": float(edge_focus_multiplier_running),
         }
         state["mask_prefail_state"] = {
             "history": [
@@ -5351,6 +5523,7 @@ def train(
             teacher_alpha = batch["teacher_alpha"]
             teacher_depth = batch.get("teacher_depth")
             teacher_depth_valid_mask = batch.get("teacher_depth_valid_mask")
+            edge_focus_scores_tensor = batch.get("edge_strength")
             near_selected = batch["near"]
             far_selected = batch["far"]
 
@@ -5401,6 +5574,8 @@ def train(
 
             student_rgb = rgb_map
             student_sigma = opacity_map
+            if edge_focus_scores_tensor is not None:
+                edge_focus_scores_tensor = edge_focus_scores_tensor.to(device)
 
             depth_mask = None
             depth_valid_fraction: Optional[torch.Tensor] = None
@@ -5505,6 +5680,89 @@ def train(
             alpha_lo_excess = torch.nn.functional.relu(alpha_fraction_le05 - alpha_guard_cfg.penalty_lo)
             alpha_lo_component = alpha_lo_excess * float(alpha_guard_cfg.fraction_lo_weight)
             alpha_penalty_core = alpha_band_component + alpha_hi_component + alpha_lo_component
+            edge_focus_mean_raw_tensor = torch.tensor(0.0, device=device)
+            edge_focus_activation_raw_tensor = torch.tensor(0.0, device=device)
+            edge_focus_multiplier_raw_tensor = torch.tensor(1.0, device=device)
+            if (
+                edge_focus_scores_tensor is not None
+                and edge_focus_scores_tensor.numel() > 0
+                and edge_focus_strength_cfg > 0.0
+            ):
+                focus_scores_flat = edge_focus_scores_tensor.view(-1)
+                topk_count = focus_scores_flat.numel()
+                if edge_focus_bandwidth_cfg > 0.0:
+                    topk_count = max(1, int(math.ceil(edge_focus_bandwidth_cfg * focus_scores_flat.numel())))
+                    topk_count = min(topk_count, focus_scores_flat.numel())
+                    if topk_count < focus_scores_flat.numel():
+                        focus_subset, _ = torch.topk(focus_scores_flat, topk_count, largest=True)
+                    else:
+                        focus_subset = focus_scores_flat
+                else:
+                    focus_subset = focus_scores_flat
+                edge_focus_mean_raw_tensor = focus_subset.mean()
+                effective_transition = edge_focus_transition_cfg if edge_focus_transition_cfg > 0.0 else 1e-6
+                activation = torch.clamp(
+                    (edge_focus_mean_raw_tensor - edge_focus_margin_cfg) / effective_transition,
+                    min=0.0,
+                    max=1.0,
+                )
+                edge_focus_activation_raw_tensor = activation
+                if torch.isfinite(activation):
+                    boost = activation * edge_focus_strength_cfg
+                    if edge_focus_max_weight_cfg > 0.0:
+                        boost = torch.clamp(boost, max=edge_focus_max_weight_cfg)
+                    edge_focus_multiplier_raw_tensor = 1.0 + boost
+
+            def _edge_focus_safe_float(tensor: torch.Tensor, default: float) -> float:
+                try:
+                    value = float(tensor.detach().cpu().item())
+                except (RuntimeError, ValueError):
+                    return default
+                if not math.isfinite(value):
+                    return default
+                return value
+
+            raw_mean_val = max(_edge_focus_safe_float(edge_focus_mean_raw_tensor, 0.0), 0.0)
+            raw_activation_val = min(max(_edge_focus_safe_float(edge_focus_activation_raw_tensor, 0.0), 0.0), 1.0)
+            raw_multiplier_val = max(_edge_focus_safe_float(edge_focus_multiplier_raw_tensor, 1.0), 1.0)
+
+            if edge_focus_smoothing_cfg > 0.0:
+                edge_focus_mean_running = _smooth_transition(edge_focus_mean_running, raw_mean_val, edge_focus_smoothing_cfg)
+                edge_focus_activation_running = _smooth_transition(
+                    edge_focus_activation_running,
+                    raw_activation_val,
+                    edge_focus_smoothing_cfg,
+                )
+                edge_focus_multiplier_running = _smooth_transition(
+                    edge_focus_multiplier_running,
+                    raw_multiplier_val,
+                    edge_focus_smoothing_cfg,
+                )
+            else:
+                edge_focus_mean_running = raw_mean_val
+                edge_focus_activation_running = raw_activation_val
+                edge_focus_multiplier_running = raw_multiplier_val
+
+            edge_focus_mean_running = max(edge_focus_mean_running, 0.0)
+            edge_focus_activation_running = min(max(edge_focus_activation_running, 0.0), 1.0)
+            edge_focus_multiplier_running = max(edge_focus_multiplier_running, 1.0)
+
+            edge_focus_mean_tensor = torch.tensor(
+                edge_focus_mean_running,
+                device=device,
+                dtype=alpha_penalty_core.dtype,
+            )
+            edge_focus_activation_tensor = torch.tensor(
+                edge_focus_activation_running,
+                device=device,
+                dtype=alpha_penalty_core.dtype,
+            )
+            edge_focus_multiplier_tensor = torch.tensor(
+                edge_focus_multiplier_running,
+                device=device,
+                dtype=alpha_penalty_core.dtype,
+            )
+            alpha_penalty_core = alpha_penalty_core * edge_focus_multiplier_tensor
             alpha_guard_penalty_tensor = alpha_penalty_core * alpha_penalty_weight
 
             total_loss = total_loss + alpha_guard_penalty_tensor
@@ -6298,6 +6556,7 @@ def train(
             log_metrics["alpha.p50_ray"] = alpha_quantile_p50.detach()
             log_metrics["alpha.p90_ray"] = alpha_quantile_p90.detach()
             log_metrics["alpha.p99_ray"] = alpha_quantile_p99.detach()
+            log_metrics["alpha.p99_minus_p90"] = (alpha_quantile_p99 - alpha_quantile_p90).detach()
             log_metrics["alpha.spread"] = alpha_spread_tensor.detach()
             log_metrics["alpha.tail_slope"] = alpha_tail_slope_tensor.detach()
             log_metrics["alpha.quantile_refresh_count"] = torch.tensor(
@@ -6338,6 +6597,12 @@ def train(
                 float(alpha_guard_relax_streak),
                 device=device,
             )
+            log_metrics["alpha.edge_focus_mean"] = edge_focus_mean_tensor.detach()
+            log_metrics["alpha.edge_activation"] = edge_focus_activation_tensor.detach()
+            log_metrics["alpha.edge_multiplier"] = edge_focus_multiplier_tensor.detach()
+            log_metrics["alpha.edge_focus_mean_raw"] = edge_focus_mean_raw_tensor.detach()
+            log_metrics["alpha.edge_activation_raw"] = edge_focus_activation_raw_tensor.detach()
+            log_metrics["alpha.edge_multiplier_raw"] = edge_focus_multiplier_raw_tensor.detach()
             direction_code: float
             if alpha_guard_last_direction == "tighten":
                 direction_code = 1.0
@@ -6866,6 +7131,36 @@ def train(
                         progress.write(f"[quicklook] unexpected failure: {err}")
                         quicklook_error_logged = True
     
+            if grad_monitor_params:
+                component_losses = {
+                    "color": loss_dict.get("color"),
+                    "opacity": loss_dict.get("opacity"),
+                    "depth": loss_dict.get("depth"),
+                }
+                component_norms: Dict[str, torch.Tensor] = {}
+                for comp_name, comp_loss in component_losses.items():
+                    if comp_loss is None or not comp_loss.requires_grad:
+                        continue
+                    grads = torch.autograd.grad(
+                        comp_loss,
+                        grad_monitor_params,
+                        retain_graph=True,
+                        allow_unused=True,
+                    )
+                    total_sq = torch.tensor(0.0, device=device)
+                    for grad in grads:
+                        if grad is None:
+                            continue
+                        total_sq = total_sq + grad.pow(2).sum()
+                    component_norms[comp_name] = torch.sqrt(total_sq + 1e-12)
+                if component_norms:
+                    total_grad_norm = torch.stack(list(component_norms.values())).sum().clamp_min(1e-12)
+                    log_metrics["grad_norm_total"] = total_grad_norm.detach()
+                    for comp_name, norm_tensor in component_norms.items():
+                        ratio_tensor = (norm_tensor / total_grad_norm).clamp(0.0, 1.0)
+                        log_metrics[f"grad_norm_abs/{comp_name}"] = norm_tensor.detach()
+                        log_metrics[f"grad_norm/{comp_name}"] = ratio_tensor.detach()
+
             enforce_promotion_gate(global_step, log_metrics)
     
             if not loss_is_finite:

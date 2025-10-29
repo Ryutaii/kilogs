@@ -118,6 +118,17 @@ Stable, reproducible pipeline for rendering & evaluating student vs teacher on *
 - tail oversampling に伴う GPU peak ≈3.24 GiB, FPS ≈0.23。リソース増加は許容範囲。
 - TODO: 1) 50K チェックポイントも評価し tail window 効果を分離、2) α 指標 (p99/spread/tail_slope) の 45K→52K 推移を確認、3) 追加で mean_target や guard パラメータを微調整して v6_tail と同等 PSNR を狙う。
 
+**2025-10-29 — v9 攻めプラン (v8 フィードバック反映)**
+- 判定: `alpha.halo_indicator≈0.29`, `alpha.p50_ray≈0.20`, 40K→50K の ΔPSNR<+0.3 dB 想定につき “攻め策 (v9-B)” を選択。尾部の停滞とハロ再燃を解消するために α mean 押しを緩めつつ輪郭限定でガードを強化する。
+- 直近作業:
+  1. `results/lego/single_view_overfit_v8/checkpoints/step_050000.pth` を `render_student.py` + `evaluate_student_metrics.py` で白/前景評価し、52K との差分 (ΔPSNR, ΔSSIM, ΔLPIPS, `alpha_*` 指標) を `metrics_summary.csv` と本ノートへ追記。tail window 増強の寄与を定量化する。
+  2. v9 用コンフィグ (`configs/generated/lego_single_view_overfit_v9.yaml`) を新規作成。主な差分: `loss.opacity.mean_target≈0.20`, `mean_weight≈0.004`, `warmup_steps≈8000`, `target_weight` は 0.09〜0.10 で据え置きつつ `max_weight` を 0.18 へ抑制。学習率は `lr_schedule_steps=46000`, `lr_schedule_min_lr=2.0e-5`, 50K 以降で `samples_per_ray_scale=1.3`。
+  3. `distill/lego_response_distill.py` に縁限定ガードを追加。α マップを軽量 downsample→モルフォロジカル勾配で輪郭マスクを抽出し、`alpha_guard` のペナルティを edge エリアのみ強化 (`edge_weight_scale` 新設)。並行して `alpha.p99 - alpha.p90` (tail クランプ確認用) を CSV/TensorBoard へ記録し、`alpha_guard` の自動ノブに新しいヒューリスティックを接続。
+  - エッジ倍率は `edge_focus_smoothing` (v9 では 0.35) でステップ間を平滑化する実装を追加し、ログには raw/平滑値の両方を記録するよう更新済み。
+  4. 同スクリプトで損失別勾配ノルム比 (`grad_norm/color`, `grad_norm/opacity`, `grad_norm/depth`) をログ出力。TensorBoard/CSV の両方で確認できるよう `metrics_floats` に追加し、比率が 1:0.3:0.3 付近に収まるかを継続監視 (α が過剰なら自動で緩むように次段で結線予定)。
+- v9 ラン TODO: 30K/40K/50K/52K を固定でレンダ・評価し、`ΔPSNR_white`, `PSNR_white − PSNR_fg`, `alpha.p50/p90/p99`, `alpha_guard_penalty`, `g_norm_ratio` を各ステップで記録。Go 条件は `alpha.halo_indicator≤0.02`, `alpha.p50≤0.16`, 40K→50K で +0.3 dB 以上。No-Go なら mean target をさらに 0.02 下げるか warmup を 10K まで延伸。
+- 次次手 (予告): v9-B で改善が弱い場合は α の復帰ノブにレート制限を付けた “v10 準備” として、輪郭限定ガード + 学習率テーパ + tail oversampling 1.4× の組み合わせを検討する。
+
 **最新アドバイス反映 — 単視点 v5 改善ロードマップ（2025-10-27 夜時点）**
 
 1. **Run A（本命）** — *min lr を 5e-5 へ下げ*、*opacity target を 0.20〜0.22 へ微増*
